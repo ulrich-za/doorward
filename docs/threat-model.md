@@ -1,7 +1,7 @@
 # doorward threat model
 
 This is what doorward defends, against whom, how, and where its protection
-stops. Each defence names the test that checks it. It covers doorward 0.2.
+stops. Each defence names the test that checks it. It covers doorward 0.1.1.
 
 ## What is protected
 

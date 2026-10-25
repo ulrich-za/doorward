@@ -1,11 +1,11 @@
 # Changelog
 
 All notable changes to doorward are listed here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/) (below 1.0, a minor version may
-break the API).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions count up
+by the last number (0.1.1, 0.1.2, …) unless stated otherwise. Below 1.0, a
+release may change the API: read the notes before upgrading.
 
-## [0.2.0] - unreleased
+## [0.1.1] - unreleased
 
 The sign-in core: everything pingrail 0.4 needs to move its sign-in into
 doorward, plus configurable addresses and the store crates.
@@ -101,5 +101,5 @@ pingrail 0.3.
 - A `cgroup` path that tries to climb out of `/sys/fs/cgroup` is ignored.
 - Typed errors instead of `anyhow`; the app decides where the policy is saved.
 
-[0.2.0]: https://github.com/ulrich-za/doorward/compare/v0.1.0...HEAD
+[0.1.1]: https://github.com/ulrich-za/doorward/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/ulrich-za/doorward/releases/tag/v0.1.0

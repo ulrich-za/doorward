@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "doorward-sqlite"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "doorward",

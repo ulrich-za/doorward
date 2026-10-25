@@ -7,8 +7,8 @@ This guide follows an axum app such as pingrail. A runnable version is in
 
 ```toml
 [dependencies]
-doorward = { version = "0.2", features = ["axum", "passkeys", "vendored-openssl"] }
-doorward-sqlite = "0.2"      # or doorward-postgres = "0.2"
+doorward = { version = "0.1.1", features = ["axum", "passkeys", "vendored-openssl"] }
+doorward-sqlite = "0.1.1"    # or doorward-postgres = "0.1.1"
 ```
 
 `vendored-openssl` builds OpenSSL into the program, so nothing has to be
