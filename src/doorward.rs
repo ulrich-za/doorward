@@ -314,6 +314,7 @@ impl Builder {
             rules: self.rules,
             recent: self.recent,
             limiter: Limiter::new(self.limits),
+            visitor_gate: tokio::sync::Semaphore::new(1),
             hash_wait: self.hash_wait,
             event_retention: self.event_retention,
             max_passkeys: self.max_passkeys_per_user,
@@ -336,6 +337,10 @@ pub(crate) struct Inner {
     rules: PasswordRules,
     recent: Duration,
     pub(crate) limiter: Limiter,
+    /// Visitors without a remembered browser check one password at a time,
+    /// so of the one or two checks the machine allows, room is left for
+    /// remembered browsers even during a flood of guesses.
+    visitor_gate: tokio::sync::Semaphore,
     hash_wait: Duration,
     event_retention: Duration,
     #[cfg_attr(not(feature = "passkeys"), allow(dead_code))]
@@ -568,6 +573,22 @@ impl Doorward {
         Ok((who, device))
     }
 
+    /// Check a password, after a turn at the visitor gate when the attempt
+    /// isn't from a remembered browser.
+    async fn check_password(&self, who: Who, password: &str, phc: Option<String>) -> Verdict {
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Verdict::Wrong;
+        }
+        let _visitor_turn = match who {
+            Who::Visitor(_) => match tokio::time::timeout(self.0.hash_wait, self.0.visitor_gate.acquire()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => return Verdict::Busy,
+            },
+            Who::Remembered(_) => None,
+        };
+        self.0.hasher.verify_async(Zeroizing::new(password.to_string()), phc, self.0.hash_wait).await
+    }
+
     pub(crate) async fn admit(&self, who: Who) -> Result<(), Error> {
         let delay = self.0.limiter.admit(who, self.now())?;
         if !delay.is_zero() {
@@ -601,15 +622,10 @@ impl Doorward {
         let (who, device) = self.who(v, user.as_ref().map(|u| u.id)).await?;
         self.admit(who).await?;
 
-        let phc = match &user {
-            Some(u) => store.password(u.id).await?,
-            None => None,
-        };
-        let verdict = if password.len() > MAX_PASSWORD_BYTES {
-            Verdict::Wrong
-        } else {
-            self.0.hasher.verify_async(Zeroizing::new(password.to_string()), phc.clone(), self.0.hash_wait).await
-        };
+        // Look a hash up even for an unknown user, so both take the same steps.
+        let phc = store.password(user.as_ref().map_or(Uuid::nil(), |u| u.id)).await?;
+        let phc = if user.is_some() { phc } else { None };
+        let verdict = self.check_password(who, password, phc.clone()).await;
         match (verdict, user, phc) {
             (Verdict::Busy, _, _) => Err(Error::Busy),
             (Verdict::Good { rehash }, Some(user), Some(phc)) => {
@@ -762,11 +778,7 @@ impl Doorward {
         let (who, _) = self.who(v, Some(session.user.id)).await?;
         self.admit(who).await?;
         let phc = self.0.store.password(session.user.id).await?;
-        let verdict = if password.len() > MAX_PASSWORD_BYTES {
-            Verdict::Wrong
-        } else {
-            self.0.hasher.verify_async(Zeroizing::new(password.to_string()), phc, self.0.hash_wait).await
-        };
+        let verdict = self.check_password(who, password, phc).await;
         match verdict {
             Verdict::Busy => Err(Error::Busy),
             Verdict::Good { .. } => self.mark_recent(v, session, rec.id, "password").await,
@@ -1152,6 +1164,25 @@ mod tests {
         assert!(!same_origin(&h(&[("sec-fetch-site", "cross-site")]), o));
         assert!(!same_origin(&h(&[("sec-fetch-site", "none")]), o), "not for writes");
         assert!(!same_origin(&h(&[("origin", "https://pc.lan:8040"), ("origin", "https://evil.example")]), o));
+    }
+
+    #[tokio::test]
+    async fn remembered_browsers_skip_the_visitor_queue() {
+        use crate::store::MemoryStore;
+        let dw = Doorward::builder(MemoryStore::new())
+            .address(Address::new("https://a.example").unwrap())
+            .hash_policy(HashPolicy { concurrency: 2, ..HashPolicy::floor() })
+            .hash_wait(Duration::from_millis(200))
+            .build()
+            .await
+            .unwrap();
+        // A flood of visitors holds the visitor gate.
+        let _flood = dw.0.visitor_gate.acquire().await.unwrap();
+        let visitor = Who::Visitor(VisitorKey::of("192.0.2.1".parse().unwrap()));
+        assert_eq!(dw.check_password(visitor, "pw", None).await, Verdict::Busy);
+        // A remembered browser still gets its check.
+        let phc = dw.0.hasher.hash("pw").unwrap();
+        assert!(dw.check_password(Who::Remembered([1; 32]), "pw", Some(phc)).await.is_good());
     }
 
     #[test]

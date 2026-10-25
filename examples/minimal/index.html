@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doorward demo</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; color: #1c2430; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #d6dbe1; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  label { display: block; margin: .5rem 0 .2rem; }
+  input[type=text], input[type=password] { width: 100%; padding: .45rem; box-sizing: border-box; }
+  button { margin: .6rem .4rem 0 0; padding: .45rem .9rem; }
+  #status { min-height: 1.5rem; color: #4a5563; }
+  #status.error { color: #b42318; }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>doorward demo</h1>
+<p id="status" role="status"></p>
+
+<section id="signed-out" hidden>
+  <form id="password-form" autocomplete="on">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username webauthn" value="admin">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password">
+    <label><input id="remember" type="checkbox"> Keep me signed in</label>
+    <button type="submit">Sign in</button>
+    <button type="button" id="passkey-sign-in">Sign in with a passkey</button>
+  </form>
+</section>
+
+<section id="signed-in" hidden>
+  <p>Signed in as <strong id="who"></strong> <span id="method"></span>.</p>
+  <button type="button" id="add-passkey">Add a passkey</button>
+  <button type="button" id="check-sensitive">Try a sensitive action</button>
+  <button type="button" id="sign-out">Sign out</button>
+  <h2>Passkeys</h2>
+  <ul id="passkeys"></ul>
+  <h2>Sessions</h2>
+  <ul id="sessions"></ul>
+  <h2>Security log</h2>
+  <ul id="events"></ul>
+</section>
+<script src="/app.js"></script>
+</body>
+</html>
