@@ -196,8 +196,9 @@ pub trait Store: Send + Sync + 'static {
     async fn session_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError>;
     /// Record a request on a session.
     async fn touch_session(&self, id: Uuid, last_seen_ms: i64, ip: Option<&str>) -> Result<(), StoreError>;
-    /// Record that the user proved who they are again.
-    async fn set_session_auth(&self, id: Uuid, auth_ms: i64) -> Result<(), StoreError>;
+    /// The user proved who they are again: give the session a new cookie
+    /// (its hash) and record the time. `false` when there is no such session.
+    async fn reauth_session(&self, id: Uuid, token_hash: &[u8; 32], auth_ms: i64) -> Result<bool, StoreError>;
     /// End a session. `false` when there was none.
     async fn delete_session(&self, id: Uuid) -> Result<bool, StoreError>;
     /// A user's sessions, newest first.

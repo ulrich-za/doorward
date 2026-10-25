@@ -22,6 +22,10 @@ pub enum Error {
     /// The new password is shorter than the app's minimum.
     #[error("password is too short")]
     PasswordTooShort,
+    /// The new password is one of the most common, contains the username, or
+    /// contains one of the app's refused words.
+    #[error("password is too easy to guess")]
+    PasswordTooCommon,
     /// A hash policy outside doorward's limits was given.
     #[error("hash policy is outside doorward's limits")]
     InvalidHashPolicy,
@@ -122,6 +126,8 @@ pub enum ErrorCode {
     PasswordTooLong,
     /// See [`Error::PasswordTooShort`].
     PasswordTooShort,
+    /// See [`Error::PasswordTooCommon`].
+    PasswordTooCommon,
     /// See [`Error::InvalidCredentials`].
     InvalidCredentials,
     /// See [`Error::PasskeyNotRecognised`].
@@ -175,6 +181,7 @@ impl ErrorCode {
             ErrorCode::Busy => "busy",
             ErrorCode::PasswordTooLong => "password_too_long",
             ErrorCode::PasswordTooShort => "password_too_short",
+            ErrorCode::PasswordTooCommon => "password_too_common",
             ErrorCode::InvalidCredentials => "invalid_credentials",
             ErrorCode::PasskeyNotRecognised => "passkey_not_recognised",
             ErrorCode::TooManyAttempts => "too_many_attempts",
@@ -221,6 +228,7 @@ impl ErrorCode {
             ErrorCode::Internal => 500,
             ErrorCode::PasswordTooLong
             | ErrorCode::PasswordTooShort
+            | ErrorCode::PasswordTooCommon
             | ErrorCode::CeremonyExpired
             | ErrorCode::UsernameInvalid
             | ErrorCode::RoleInvalid
@@ -243,6 +251,7 @@ impl Error {
             Error::Busy => ErrorCode::Busy,
             Error::PasswordTooLong => ErrorCode::PasswordTooLong,
             Error::PasswordTooShort => ErrorCode::PasswordTooShort,
+            Error::PasswordTooCommon => ErrorCode::PasswordTooCommon,
             Error::InvalidCredentials => ErrorCode::InvalidCredentials,
             Error::PasskeyNotRecognised => ErrorCode::PasskeyNotRecognised,
             Error::TooManyAttempts { .. } => ErrorCode::TooManyAttempts,
@@ -292,6 +301,7 @@ mod tests {
             ErrorCode::Busy,
             ErrorCode::PasswordTooLong,
             ErrorCode::PasswordTooShort,
+            ErrorCode::PasswordTooCommon,
             ErrorCode::InvalidCredentials,
             ErrorCode::PasskeyNotRecognised,
             ErrorCode::TooManyAttempts,

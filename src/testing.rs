@@ -146,7 +146,7 @@ impl TestAuthenticator {
         let mut id = vec![0u8; 32];
         getrandom::fill(&mut id).unwrap();
         let key = new_key();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let cose = cbor(&Value::Map(vec![
             (int(1), int(2)),
             (int(3), int(-7)),

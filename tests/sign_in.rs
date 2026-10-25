@@ -129,7 +129,10 @@ async fn cross_site_requests_are_refused() {
     let mut evil = b.clone();
     evil.origin_header = Some("https://evil.example".into());
     assert!(matches!(e.dw.authenticate(&evil.post(&e.dw)).await, Err(Error::CrossOrigin)));
-    assert!(matches!(e.dw.change_password(&evil.post(&e.dw), "another long one").await, Err(Error::CrossOrigin)));
+    assert!(matches!(
+        e.dw.change_password(&evil.post(&e.dw), Some("correct horse battery"), "another long one").await,
+        Err(Error::CrossOrigin)
+    ));
     // Reading with GET is not a write; it still authenticates.
     assert!(e.dw.authenticate(&evil.get(&e.dw)).await.unwrap().is_some());
     // Login CSRF: signing a victim in to the attacker's account.
@@ -190,10 +193,10 @@ async fn keep_me_signed_in() {
 async fn a_new_sign_in_replaces_a_planted_cookie() {
     let e = env().await;
     e.user("admin", Some("correct horse battery")).await;
-    e.user("mallory", Some("mallory's password")).await;
+    e.user("mallory", Some("an attacker's own secret")).await;
     // Mallory signs in and plants her session cookie in the victim's browser.
     let mut mallory = Browser::lan();
-    let ms = e.dw.sign_in_password(&mallory.post(&e.dw), "mallory", "mallory's password", false).await.unwrap();
+    let ms = e.dw.sign_in_password(&mallory.post(&e.dw), "mallory", "an attacker's own secret", false).await.unwrap();
     mallory.take(&ms.cookies);
     let mut victim = Browser::lan();
     victim.jar.insert("__Host-doorward".into(), mallory.jar["__Host-doorward"].clone());
@@ -254,7 +257,7 @@ async fn a_remembered_browser_counts_only_for_its_own_user() {
     })
     .await;
     e.user("admin", Some("correct horse battery")).await;
-    e.user("other", Some("another password")).await;
+    e.user("other", Some("a second user secret")).await;
     let mut b = Browser::lan();
     let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
     b.take(&s.cookies);
@@ -262,7 +265,7 @@ async fn a_remembered_browser_counts_only_for_its_own_user() {
     assert!(e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.is_ok());
     // …but not for another account.
     assert!(matches!(
-        e.dw.sign_in_password(&b.post(&e.dw), "other", "another password", false).await,
+        e.dw.sign_in_password(&b.post(&e.dw), "other", "a second user secret", false).await,
         Err(Error::TooManyAttempts { .. })
     ));
 }
@@ -281,13 +284,65 @@ async fn recent_sign_in_and_confirming() {
     e.clock.advance(Duration::from_secs(61));
     let me = e.dw.require_session(&b.get(&e.dw)).await.unwrap();
     assert!(matches!(e.dw.require_recent(&me), Err(Error::NeedsRecentSignIn)));
-    assert!(matches!(e.dw.change_password(&b.post(&e.dw), "a new long password").await, Err(Error::NeedsRecentSignIn)));
+    assert!(matches!(e.dw.end_other_sessions(&b.post(&e.dw), &me).await, Err(Error::NeedsRecentSignIn)));
     assert!(matches!(e.dw.confirm_password(&b.post(&e.dw), "wrong").await, Err(Error::InvalidCredentials)));
-    let me = e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
-    assert!(e.dw.is_recent(&me));
+    let old = b.clone();
+    let confirmed = e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
+    assert!(e.dw.is_recent(&confirmed.session));
+    b.take(&confirmed.cookies);
+    // Re-authenticating issues a new cookie; the old value stops working.
+    assert_ne!(old.jar["__Host-doorward"], b.jar["__Host-doorward"]);
+    assert!(e.dw.authenticate(&old.get(&e.dw)).await.unwrap().is_none());
     let me = e.dw.require_session(&b.get(&e.dw)).await.unwrap();
     assert!(e.dw.is_recent(&me), "saved");
-    e.dw.change_password(&b.post(&e.dw), "a new long password").await.unwrap();
+    assert_eq!(me.id, confirmed.session.id, "the same session");
+    assert_eq!(e.dw.end_other_sessions(&b.post(&e.dw), &me).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn changing_a_password_needs_the_current_one() {
+    let e = env().await;
+    e.user("admin", Some("correct horse battery")).await;
+    let mut b = Browser::lan();
+    let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+    b.take(&s.cookies);
+    for current in [None, Some("wrong")] {
+        let err = e.dw.change_password(&b.post(&e.dw), current, "a new long password").await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidCredentials, "{current:?}");
+    }
+    // Even long after signing in, the current password is enough.
+    e.clock.advance(Duration::from_secs(3600));
+    let old = b.clone();
+    let s = e.dw.change_password(&b.post(&e.dw), Some("correct horse battery"), "a new long password").await.unwrap();
+    b.take(&s.cookies);
+    assert!(e.dw.authenticate(&old.get(&e.dw)).await.unwrap().is_none(), "a new cookie after the change");
+    assert!(e.dw.authenticate(&b.get(&e.dw)).await.unwrap().is_some());
+    let fresh = Browser::lan();
+    assert!(e.dw.sign_in_password(&fresh.post(&e.dw), "admin", "a new long password", false).await.is_ok());
+}
+
+#[tokio::test]
+async fn easy_passwords_are_refused() {
+    let e = env_with(|b| b.refuse_password_words(["pingrail", "Northwind", "abc"])).await;
+    let u = e.user("ulrich", Some("correct horse battery")).await;
+    for (pw, code) in [
+        ("password", ErrorCode::PasswordTooCommon),
+        ("PASSWORD", ErrorCode::PasswordTooCommon),
+        ("1qaz2wsx", ErrorCode::PasswordTooCommon),
+        ("my name is ulrich!", ErrorCode::PasswordTooCommon),
+        ("pingrail-admin-2026", ErrorCode::PasswordTooCommon),
+        ("northwind rocks", ErrorCode::PasswordTooCommon),
+        ("short", ErrorCode::PasswordTooShort),
+    ] {
+        assert_eq!(e.dw.set_password(u.id, pw).await.unwrap_err().code(), code, "{pw}");
+    }
+    // Short words are ignored; character classes are never required.
+    assert!(e.dw.set_password(u.id, "abcdefghijklmnop").await.is_ok());
+    assert!(e.dw.set_password(u.id, "\u{1F600} \u{1F680} lowercase only \u{fc}").await.is_ok());
+    // 64 and more characters are fine.
+    assert!(e.dw.set_password(u.id, &"z".repeat(200)).await.is_ok());
+    let new = NewUser { username: "bob".into(), password: Some("football".to_string().into()), ..Default::default() };
+    assert_eq!(e.dw.create_user(new).await.unwrap_err().code(), ErrorCode::PasswordTooCommon);
 }
 
 #[tokio::test]
@@ -305,15 +360,17 @@ async fn changing_a_password_ends_other_sessions() {
     assert_eq!(list.len(), 2);
     assert_eq!(list.iter().filter(|x| x.current).count(), 1);
 
-    e.dw.change_password(&phone.post(&e.dw), "a brand new password").await.unwrap();
+    let s =
+        e.dw.change_password(&phone.post(&e.dw), Some("correct horse battery"), "a brand new password").await.unwrap();
+    phone.take(&s.cookies);
     assert!(e.dw.authenticate(&phone.get(&e.dw)).await.unwrap().is_some(), "this one stays");
     assert!(e.dw.authenticate(&laptop.get(&e.dw)).await.unwrap().is_none(), "the other ended");
     assert!(e.dw.sign_in_password(&laptop.post(&e.dw), "admin", "correct horse battery", false).await.is_err());
     // Rules for new passwords.
-    let short = e.dw.change_password(&phone.post(&e.dw), "short").await.unwrap_err();
+    let short = e.dw.change_password(&phone.post(&e.dw), Some("a brand new password"), "short").await.unwrap_err();
     assert_eq!(short.code(), ErrorCode::PasswordTooShort);
     // An admin reset ends every session.
-    e.dw.set_password(u.id, "set by the admin").await.unwrap();
+    e.dw.set_password(u.id, "reset by the boss").await.unwrap();
     assert!(e.dw.authenticate(&phone.get(&e.dw)).await.unwrap().is_none());
     let events: Vec<String> = e.store.events_for_user(u.id, 50).await.unwrap().into_iter().map(|x| x.kind).collect();
     assert!(
@@ -344,6 +401,13 @@ async fn ending_sessions() {
     assert!(matches!(e.dw.end_session(&eve.post(&e.dw), &eve_s, me.id).await, Err(Error::NotFound)));
     let other = e.dw.sessions(&me).await.unwrap().into_iter().find(|x| !x.current).unwrap();
     e.dw.end_session(&a.post(&e.dw), &me, other.id).await.unwrap();
+    // After ten minutes, ending another session needs a confirmation first.
+    e.clock.advance(Duration::from_secs(11 * 60));
+    let stale = e.dw.require_session(&a.get(&e.dw)).await.unwrap();
+    assert!(matches!(e.dw.end_other_sessions(&a.post(&e.dw), &stale).await, Err(Error::NeedsRecentSignIn)));
+    let c = e.dw.confirm_password(&a.post(&e.dw), "correct horse battery").await.unwrap();
+    a.take(&c.cookies);
+    let me = e.dw.require_session(&a.get(&e.dw)).await.unwrap();
     assert!(e.dw.authenticate(&b.get(&e.dw)).await.unwrap().is_none());
     let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
     b.take(&s.cookies);
@@ -459,7 +523,7 @@ async fn configuration_is_checked() {
     assert!(ok().address(Address::new(LAN).unwrap()).recent_sign_in(Duration::from_secs(5)).build().await.is_err());
     assert!(
         ok().address(Address::new(LAN).unwrap())
-            .password_rules(PasswordRules { min_chars: 0, max_chars: 10 })
+            .password_rules(PasswordRules { min_chars: 0, max_chars: 10, refuse_common: true })
             .build()
             .await
             .is_err()

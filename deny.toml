@@ -1,0 +1,40 @@
+# cargo-deny: run `cargo deny check` (CI runs it on every change).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Add an advisory here only with a reason and a date to revisit it.
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Licences compatible with doorward's Apache-2.0. webauthn-rs is MPL-2.0
+# (file-level copyleft: fine as a dependency, changes to its files stay MPL).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "0BSD",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

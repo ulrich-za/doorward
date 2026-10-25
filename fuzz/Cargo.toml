@@ -1,0 +1,35 @@
+[package]
+name = "doorward-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+doorward = { path = "..", features = ["fuzzing"] }
+
+[workspace]
+
+[[bin]]
+name = "request_headers"
+path = "fuzz_targets/request_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "password_hashes"
+path = "fuzz_targets/password_hashes.rs"
+test = false
+doc = false
+bench = false

@@ -133,6 +133,7 @@ pub struct Builder {
     event_retention: Duration,
     rp_name: String,
     max_passkeys_per_user: usize,
+    refused_words: Vec<String>,
 }
 
 impl Builder {
@@ -221,6 +222,19 @@ impl Builder {
     /// The app's name, shown by authenticators when making a passkey.
     pub fn app_name(mut self, name: &str) -> Builder {
         self.rp_name = name.to_string();
+        self
+    }
+
+    /// Words new passwords may not contain, such as the app's and the
+    /// organisation's names (compared in lowercase; words under 4 characters
+    /// are ignored).
+    pub fn refuse_password_words<I, S>(mut self, words: I) -> Builder
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.refused_words
+            .extend(words.into_iter().map(|w| w.as_ref().trim().to_lowercase()).filter(|w| w.chars().count() >= 4));
         self
     }
 
@@ -318,6 +332,7 @@ impl Builder {
             hash_wait: self.hash_wait,
             event_retention: self.event_retention,
             max_passkeys: self.max_passkeys_per_user,
+            refused_words: self.refused_words,
             #[cfg(feature = "passkeys")]
             passkeys,
         })))
@@ -345,6 +360,7 @@ pub(crate) struct Inner {
     event_retention: Duration,
     #[cfg_attr(not(feature = "passkeys"), allow(dead_code))]
     pub(crate) max_passkeys: usize,
+    refused_words: Vec<String>,
     #[cfg(feature = "passkeys")]
     pub(crate) passkeys: crate::passkey::Passkeys,
 }
@@ -404,6 +420,7 @@ impl Doorward {
             event_retention: Duration::from_secs(90 * 86_400),
             rp_name: "doorward".into(),
             max_passkeys_per_user: 20,
+            refused_words: Vec::new(),
         }
     }
 
@@ -768,8 +785,9 @@ impl Doorward {
     }
 
     /// Confirm it's still the user by asking for their password again. On
-    /// success the session counts as recent.
-    pub async fn confirm_password(&self, v: &Visit, password: &str) -> Result<Session, Error> {
+    /// success the session counts as recent and gets a new cookie (send the
+    /// returned cookies), so a copy of the old one stops working.
+    pub async fn confirm_password(&self, v: &Visit, password: &str) -> Result<SignedIn, Error> {
         self.refuse_cross_origin(v)?;
         let (session, rec) = self.authenticate_record(v).await?.ok_or(Error::NotSignedIn)?;
         if !self.address_of(v).allows_passwords() {
@@ -781,7 +799,7 @@ impl Doorward {
         let verdict = self.check_password(who, password, phc).await;
         match verdict {
             Verdict::Busy => Err(Error::Busy),
-            Verdict::Good { .. } => self.mark_recent(v, session, rec.id, "password").await,
+            Verdict::Good { .. } => self.mark_recent(v, session, &rec, "password").await,
             Verdict::Wrong => {
                 self.0.limiter.failed(who, self.now());
                 self.event(Some(session.user.id), "confirm_failed", Some(v), Some(r#"{"method":"password"}"#)).await;
@@ -790,23 +808,32 @@ impl Doorward {
         }
     }
 
+    /// The user proved who they are again: a new cookie for the same session
+    /// (the old value stops working), and the session counts as recent.
     pub(crate) async fn mark_recent(
         &self,
         v: &Visit,
         mut session: Session,
-        id: Uuid,
+        rec: &SessionRecord,
         how: &str,
-    ) -> Result<Session, Error> {
+    ) -> Result<SignedIn, Error> {
         let now = self.now();
-        self.0.store.set_session_auth(id, now).await?;
+        let (token, hash) = token::new_token()?;
+        if !self.0.store.reauth_session(rec.id, &hash, now).await? {
+            return Err(Error::NotSignedIn);
+        }
         session.auth_ms = now;
+        let max_age = rec.persistent.then(|| (rec.created_ms.saturating_add(rec.max_ms) - now) / 1000);
+        let cookie = SetCookie::set(&self.0.cookie, &token, max_age);
         self.event(Some(session.user.id), "confirmed", Some(v), Some(&format!(r#"{{"method":"{how}"}}"#))).await;
-        Ok(session)
+        Ok(SignedIn { session, cookies: vec![cookie] })
     }
 
     // ----- the user's own account ------------------------------------------------
 
-    fn check_new_password(&self, password: &str) -> Result<(), Error> {
+    /// Check a new password against the rules: its length, the most common
+    /// passwords, the user's own name and the app's words.
+    pub fn check_new_password(&self, username: &str, password: &str) -> Result<(), Error> {
         let n = password.chars().count();
         if password.len() > MAX_PASSWORD_BYTES || n > self.0.rules.max_chars {
             return Err(Error::PasswordTooLong);
@@ -814,22 +841,57 @@ impl Doorward {
         if n < self.0.rules.min_chars {
             return Err(Error::PasswordTooShort);
         }
+        let lower = password.to_lowercase();
+        if self.0.rules.refuse_common && crate::common::is_common(&lower) {
+            return Err(Error::PasswordTooCommon);
+        }
+        let name = username.to_lowercase();
+        if name.chars().count() >= 4 && lower.contains(&name) {
+            return Err(Error::PasswordTooCommon);
+        }
+        if self.0.refused_words.iter().any(|w| lower.contains(w.as_str())) {
+            return Err(Error::PasswordTooCommon);
+        }
         Ok(())
     }
 
-    async fn hash_new(&self, password: &str) -> Result<String, Error> {
-        self.check_new_password(password)?;
+    async fn hash_new(&self, username: &str, password: &str) -> Result<String, Error> {
+        self.check_new_password(username, password)?;
         self.0.hasher.hash_async(Zeroizing::new(password.to_string()), self.0.hash_wait).await
     }
 
-    /// Change the signed-in user's own password. Needs a recent sign-in.
-    /// Every other session of theirs ends; this one stays.
-    pub async fn change_password(&self, v: &Visit, new_password: &str) -> Result<(), Error> {
+    /// Change the signed-in user's own password. A user who has a password
+    /// must give it (`current`); a user without one (passkeys only) needs a
+    /// recent sign-in instead. Every other session of theirs ends; this one
+    /// gets a new cookie (send the returned cookies).
+    pub async fn change_password(
+        &self,
+        v: &Visit,
+        current: Option<&str>,
+        new_password: &str,
+    ) -> Result<SignedIn, Error> {
         self.refuse_cross_origin(v)?;
         let (session, rec) = self.authenticate_record(v).await?.ok_or(Error::NotSignedIn)?;
-        self.require_recent(&session)?;
-        let phc = self.hash_new(new_password).await?;
         let store = &self.0.store;
+        // Check the new one first: a refused new password costs no guess at the old one.
+        self.check_new_password(&session.user.username, new_password)?;
+        match store.password(session.user.id).await? {
+            Some(old) => {
+                let (who, _) = self.who(v, Some(session.user.id)).await?;
+                self.admit(who).await?;
+                match self.check_password(who, current.unwrap_or(""), Some(old)).await {
+                    Verdict::Good { .. } => {}
+                    Verdict::Busy => return Err(Error::Busy),
+                    Verdict::Wrong => {
+                        self.0.limiter.failed(who, self.now());
+                        self.event(Some(session.user.id), "password_change_failed", Some(v), None).await;
+                        return Err(Error::InvalidCredentials);
+                    }
+                }
+            }
+            None => self.require_recent(&session)?,
+        }
+        let phc = self.hash_new(&session.user.username, new_password).await?;
         store.set_password(session.user.id, &phc, self.now()).await?;
         let ended = store.delete_sessions_for_user(session.user.id, Some(rec.id)).await?;
         self.event(
@@ -839,7 +901,7 @@ impl Doorward {
             Some(&format!(r#"{{"sessions_ended":{ended}}}"#)),
         )
         .await;
-        Ok(())
+        self.mark_recent(v, session, &rec, "password").await
     }
 
     /// The signed-in user's sessions, newest first, marking this one.
@@ -857,9 +919,13 @@ impl Doorward {
     }
 
     /// End one of the signed-in user's sessions (it may be this one; then
-    /// clear the cookie too). [`Error::NotFound`] when it isn't theirs.
+    /// clear the cookie too). Ending another session needs a recent sign-in.
+    /// [`Error::NotFound`] when it isn't theirs.
     pub async fn end_session(&self, v: &Visit, s: &Session, id: Uuid) -> Result<(), Error> {
         self.refuse_cross_origin(v)?;
+        if id != s.id {
+            self.require_recent(s)?;
+        }
         let mine = self.0.store.sessions_for_user(s.user.id).await?.iter().any(|r| r.id == id);
         if !mine || !self.0.store.delete_session(id).await? {
             return Err(Error::NotFound);
@@ -869,9 +935,10 @@ impl Doorward {
     }
 
     /// End every other session of the signed-in user ("sign out everywhere
-    /// else"). Returns how many ended.
+    /// else"). Needs a recent sign-in. Returns how many ended.
     pub async fn end_other_sessions(&self, v: &Visit, s: &Session) -> Result<u64, Error> {
         self.refuse_cross_origin(v)?;
+        self.require_recent(s)?;
         let n = self.0.store.delete_sessions_for_user(s.user.id, Some(s.id)).await?;
         self.event(Some(s.user.id), "sessions_ended", Some(v), Some(&format!(r#"{{"count":{n}}}"#))).await;
         Ok(n)
@@ -893,7 +960,7 @@ impl Doorward {
             username::check_role(r)?;
         }
         let phc = match &new.password {
-            Some(p) => Some(self.hash_new(p).await?),
+            Some(p) => Some(self.hash_new(name.as_str(), p).await?),
             None => None,
         };
         let display = clean_display_name(new.display_name.as_deref().unwrap_or(name.as_str()));
@@ -941,10 +1008,8 @@ impl Doorward {
     /// machine). Every session of theirs ends.
     pub async fn set_password(&self, id: Uuid, password: &str) -> Result<(), Error> {
         let store = &self.0.store;
-        if store.user(id).await?.is_none() {
-            return Err(Error::NotFound);
-        }
-        let phc = self.hash_new(password).await?;
+        let user = store.user(id).await?.ok_or(Error::NotFound)?;
+        let phc = self.hash_new(&user.username, password).await?;
         store.set_password(id, &phc, self.now()).await?;
         store.delete_sessions_for_user(id, None).await?;
         self.event(Some(id), "password_set", None, None).await;
@@ -1107,6 +1172,11 @@ impl Doorward {
             tracing::error!(target: "doorward::security", "writing the security log failed: {err}");
         }
     }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn same_origin_for_tests(headers: &HeaderMap, origin: &str) -> bool {
+    same_origin(headers, origin)
 }
 
 fn conflict_to_taken(e: StoreError) -> Error {

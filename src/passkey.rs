@@ -484,13 +484,14 @@ impl Doorward {
         Ok(PasskeyChallenge { ceremony: id, options })
     }
 
-    /// Finish confirming with a passkey. On success the session counts as recent.
+    /// Finish confirming with a passkey. On success the session counts as
+    /// recent and gets a new cookie (send the returned cookies).
     pub async fn passkey_confirm_finish(
         &self,
         v: &Visit,
         ceremony: &str,
         credential: &PublicKeyCredential,
-    ) -> Result<Session, Error> {
+    ) -> Result<SignedIn, Error> {
         if v.is_cross_origin() {
             return Err(Error::CrossOrigin);
         }
@@ -514,7 +515,7 @@ impl Doorward {
                 if let Some((r, pk)) = keys.into_iter().find(|(_, p)| p.cred_id() == result.cred_id()) {
                     self.passkey_used(&r, pk, &result).await?;
                 }
-                self.mark_recent(v, session, rec.id, "passkey").await
+                self.mark_recent(v, session, &rec, "passkey").await
             }
             Err(e) => {
                 tracing::info!(target: "doorward::security", user = %session.user.id, "passkey confirmation refused: {e}");

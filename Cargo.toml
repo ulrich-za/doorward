@@ -10,7 +10,7 @@ repository = "https://github.com/ulrich-za/doorward"
 readme = "README.md"
 keywords = ["authentication", "passkeys", "webauthn", "argon2", "login"]
 categories = ["authentication", "cryptography", "web-programming"]
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE", "docs/*.md"]
+include = ["src/**/*.rs", "src/common-passwords.txt", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE", "docs/*.md"]
 
 [workspace]
 members = [".", "doorward-sqlite"]
@@ -25,6 +25,8 @@ passkeys = ["dep:webauthn-rs"]
 vendored-openssl = ["passkeys", "dep:openssl", "openssl/vendored"]
 axum = ["dep:axum"]
 test-util = ["dep:p256", "dep:ciborium"]
+# Exposes internal parsers to the fuzz targets in fuzz/. Not for apps.
+fuzzing = []
 
 [dependencies]
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash", "zeroize"] }
@@ -48,7 +50,7 @@ webauthn-rs = { version = "0.5.5", default-features = false, features = ["condit
 openssl = { version = "0.10.73", optional = true }
 
 # test-util: a software passkey authenticator.
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"], optional = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"], optional = true }
 ciborium = { version = "0.2.2", optional = true }
 
 # Memory is read directly on Linux; other systems ask the OS through sysinfo.
@@ -61,6 +63,7 @@ tower = { version = "0.5.2", features = ["util"] }
 http-body-util = "0.1.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 axum = { version = "0.8.4", features = ["macros"] }
+proptest = "1.7"
 
 [[example]]
 name = "minimal"

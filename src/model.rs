@@ -211,11 +211,14 @@ pub struct PasswordRules {
     pub min_chars: usize,
     /// Most characters (never more than 1 KiB of UTF-8 in any case).
     pub max_chars: usize,
+    /// Refuse the 5,000 most common passwords of 8 or more characters
+    /// (OWASP ASVS 6.2.4 asks for at least the top 3,000).
+    pub refuse_common: bool,
 }
 
 impl Default for PasswordRules {
     fn default() -> PasswordRules {
-        PasswordRules { min_chars: 8, max_chars: 256 }
+        PasswordRules { min_chars: 8, max_chars: 256, refuse_common: true }
     }
 }
 

@@ -82,7 +82,8 @@ async fn adding_a_passkey_needs_a_recent_sign_in_and_ends_other_sessions() {
 
     e.clock.advance(Duration::from_secs(11 * 60));
     assert!(matches!(e.dw.passkey_register_start(&b.post(&e.dw), "x").await, Err(Error::NeedsRecentSignIn)));
-    e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
+    let c = e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
+    b.take(&c.cookies);
     let start = e.dw.passkey_register_start(&b.post(&e.dw), "x").await.unwrap();
     let mut device = TestAuthenticator::new();
     let answer = device.register(&b.origin, &start.options).unwrap();
@@ -131,7 +132,8 @@ async fn requests_are_single_use_and_tied_to_their_address_and_session() {
     ));
 
     // A registration started in one session can't be finished in another.
-    e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
+    let c = e.dw.confirm_password(&b.post(&e.dw), "correct horse battery").await.unwrap();
+    b.take(&c.cookies);
     let start = e.dw.passkey_register_start(&b.post(&e.dw), "second").await.unwrap();
     let mut device2 = TestAuthenticator::new();
     let answer = reg(device2.register(&b.origin, &start.options).unwrap());
@@ -187,8 +189,8 @@ async fn forged_answers_are_refused() {
     // A different key presenting the victim's user handle.
     let mut attacker = TestAuthenticator::new();
     let mut ab = Browser::lan();
-    e.user("mallory", Some("mallory's password")).await;
-    let s = e.dw.sign_in_password(&ab.post(&e.dw), "mallory", "mallory's password", false).await.unwrap();
+    e.user("mallory", Some("an attacker's own secret")).await;
+    let s = e.dw.sign_in_password(&ab.post(&e.dw), "mallory", "an attacker's own secret", false).await.unwrap();
     ab.take(&s.cookies);
     let start = e.dw.passkey_register_start(&ab.post(&e.dw), "mine").await.unwrap();
     let a = attacker.register(&ab.origin, &start.options).unwrap();
@@ -301,8 +303,12 @@ async fn confirming_with_a_passkey() {
     let opts = serde_json::to_value(&start.options).unwrap();
     assert!(opts["publicKey"]["allowCredentials"].as_array().is_some_and(|a| a.len() == 1));
     let ans = cred(device.sign_in(&b.origin, &opts).unwrap());
-    let me = e.dw.passkey_confirm_finish(&b.post(&e.dw), &start.ceremony, &ans).await.unwrap();
-    assert!(e.dw.is_recent(&me));
+    let old = b.clone();
+    let c = e.dw.passkey_confirm_finish(&b.post(&e.dw), &start.ceremony, &ans).await.unwrap();
+    assert!(e.dw.is_recent(&c.session));
+    b.take(&c.cookies);
+    assert!(e.dw.authenticate(&old.get(&e.dw)).await.unwrap().is_none(), "a new cookie after confirming");
+    assert!(e.dw.is_recent(&e.dw.require_session(&b.get(&e.dw)).await.unwrap()));
 }
 
 #[tokio::test]

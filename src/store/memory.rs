@@ -197,11 +197,19 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn set_session_auth(&self, id: Uuid, auth_ms: i64) -> Result<(), StoreError> {
-        if let Some(x) = self.lock().sessions.get_mut(&id) {
-            x.auth_ms = auth_ms;
+    async fn reauth_session(&self, id: Uuid, token_hash: &[u8; 32], auth_ms: i64) -> Result<bool, StoreError> {
+        let mut s = self.lock();
+        if s.sessions.values().any(|x| &x.token_hash == token_hash) {
+            return Err(StoreError::Conflict("session"));
         }
-        Ok(())
+        match s.sessions.get_mut(&id) {
+            Some(x) => {
+                x.token_hash = *token_hash;
+                x.auth_ms = auth_ms;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn delete_session(&self, id: Uuid) -> Result<bool, StoreError> {

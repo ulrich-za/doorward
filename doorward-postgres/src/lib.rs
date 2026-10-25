@@ -440,14 +440,15 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn set_session_auth(&self, id: Uuid, auth_ms: i64) -> Result<(), StoreError> {
-        sqlx::query("UPDATE auth_sessions SET auth_ms = $2 WHERE id = $1")
+    async fn reauth_session(&self, id: Uuid, token_hash: &[u8; 32], auth_ms: i64) -> Result<bool, StoreError> {
+        let r = sqlx::query("UPDATE auth_sessions SET token_hash = $2, auth_ms = $3 WHERE id = $1")
             .bind(id)
+            .bind(token_hash.as_slice())
             .bind(auth_ms)
             .execute(&self.pool)
             .await
             .map_err(map_err)?;
-        Ok(())
+        Ok(r.rows_affected() > 0)
     }
 
     async fn delete_session(&self, id: Uuid) -> Result<bool, StoreError> {

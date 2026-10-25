@@ -55,6 +55,7 @@
 
 mod address;
 mod clock;
+mod common;
 mod doorward;
 mod error;
 mod limits;
@@ -73,6 +74,13 @@ pub mod axum;
 
 #[cfg(feature = "test-util")]
 pub mod testing;
+
+#[cfg(test)]
+mod properties;
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod __fuzz;
 
 pub use address::{Address, SessionLengths, Via};
 pub use clock::{Clock, ManualClock, SystemClock};

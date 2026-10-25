@@ -302,6 +302,9 @@ pub struct Confirm {
 /// `POST /password` body.
 #[derive(Deserialize)]
 pub struct NewPassword {
+    /// The current password (required when the user has one).
+    #[serde(default)]
+    pub current_password: Option<Zeroizing<String>>,
     /// The new password.
     pub new_password: Zeroizing<String>,
 }
@@ -314,7 +317,7 @@ pub struct NewPassword {
 /// | POST | `/sign-in` | `{username, password, remember}` |
 /// | POST | `/sign-out` | |
 /// | POST | `/confirm` | `{password}`: counts as a recent sign-in |
-/// | POST | `/password` | `{new_password}`: needs a recent sign-in |
+/// | POST | `/password` | `{current_password, new_password}` (no current password for a passkey-only user, who needs a recent sign-in instead) |
 /// | GET | `/sessions` | Where you're signed in |
 /// | DELETE | `/sessions/{id}` | End one |
 /// | POST | `/sessions/end-others` | Sign out everywhere else |
@@ -398,7 +401,7 @@ where
 {
     let dw = Doorward::from_ref(&state);
     let s = dw.confirm_password(&v, &b.password).await?;
-    Ok(no_store(Json(session_view(&dw, &v, Some(&s))).into_response()))
+    Ok(signed_in_response(&dw, &v, s))
 }
 
 async fn change_password<S>(
@@ -410,8 +413,8 @@ where
     Doorward: FromRef<S>,
 {
     let dw = Doorward::from_ref(&state);
-    dw.change_password(&v, &b.new_password).await?;
-    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+    let s = dw.change_password(&v, b.current_password.as_deref().map(|p| p.as_str()), &b.new_password).await?;
+    Ok(signed_in_response(&dw, &v, s))
 }
 
 async fn list_sessions<S>(State(state): State<S>, me: Authenticated) -> Result<Json<Vec<SessionInfo>>, AuthError>
@@ -510,7 +513,7 @@ mod passkeys {
     {
         let dw = Doorward::from_ref(&state);
         let s = dw.passkey_confirm_finish(&v, &b.ceremony, &b.credential).await?;
-        Ok(no_store(Json(session_view(&dw, &v, Some(&s))).into_response()))
+        Ok(signed_in_response(&dw, &v, s))
     }
 
     pub async fn list<S>(State(state): State<S>, me: Authenticated) -> Result<Json<Vec<PasskeyInfo>>, AuthError>

@@ -189,9 +189,14 @@ async fn sessions<S: Store + ?Sized>(s: &S) {
     assert_eq!(list.iter().map(|x| x.id).collect::<Vec<_>>(), vec![b.id, a.id], "newest first");
 
     s.touch_session(a.id, 1_500, Some("192.0.2.9")).await.unwrap();
-    s.set_session_auth(a.id, 1_400).await.unwrap();
-    let got = s.session_by_token(&a.token_hash).await.unwrap().unwrap();
-    assert_eq!((got.last_seen_ms, got.ip.as_deref(), got.auth_ms), (1_500, Some("192.0.2.9"), 1_400));
+    let new_hash = hash32();
+    assert!(s.reauth_session(a.id, &new_hash, 1_400).await.unwrap());
+    assert_eq!(s.session_by_token(&a.token_hash).await.unwrap(), None, "the old cookie no longer works");
+    let got = s.session_by_token(&new_hash).await.unwrap().unwrap();
+    assert_eq!((got.id, got.last_seen_ms, got.ip.as_deref(), got.auth_ms), (a.id, 1_500, Some("192.0.2.9"), 1_400));
+    assert!(s.reauth_session(a.id, &b.token_hash, 1_401).await.is_err(), "token hashes stay unique");
+    assert!(!s.reauth_session(uuid(), &hash32(), 1).await.unwrap());
+    let a = SessionRecord { token_hash: new_hash, ..a };
     s.touch_session(a.id, 1_600, None).await.unwrap();
     assert_eq!(s.session_by_token(&a.token_hash).await.unwrap().unwrap().ip, None);
 

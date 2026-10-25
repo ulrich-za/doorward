@@ -212,7 +212,13 @@ async fn cross_site_writes_are_refused() {
     let mut c = Client::new(&e.dw);
     c.send("POST", "/auth/sign-in", Some(json!({"username": "admin", "password": "correct horse battery"}))).await;
     c.origin = "https://evil.example".into();
-    let r = c.send("POST", "/auth/password", Some(json!({"new_password": "hijacked password"}))).await;
+    let r = c
+        .send(
+            "POST",
+            "/auth/password",
+            Some(json!({"current_password": "correct horse battery", "new_password": "hijacked password"})),
+        )
+        .await;
     assert_eq!((r.status, r.body["error"].as_str()), (StatusCode::FORBIDDEN, Some("cross_origin")));
     let r = c.send("POST", "/auth/sessions/end-others", None).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
@@ -223,11 +229,11 @@ async fn roles_and_recent_sign_in() {
     let e = env().await;
     let admin = e.user("admin", Some("correct horse battery")).await;
     e.dw.set_roles(admin.id, &["admin".into()]).await.unwrap();
-    e.user("tech", Some("a tech's password")).await;
+    e.user("tech", Some("a field engineer's secret")).await;
     let mut a = Client::new(&e.dw);
     a.send("POST", "/auth/sign-in", Some(json!({"username": "admin", "password": "correct horse battery"}))).await;
     let mut t = Client::new(&e.dw);
-    t.send("POST", "/auth/sign-in", Some(json!({"username": "tech", "password": "a tech's password"}))).await;
+    t.send("POST", "/auth/sign-in", Some(json!({"username": "tech", "password": "a field engineer's secret"}))).await;
     assert_eq!(a.send("GET", "/api/admin", None).await.status, StatusCode::OK);
     let r = t.send("GET", "/api/admin", None).await;
     assert_eq!((r.status, r.body["error"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")));
@@ -242,10 +248,35 @@ async fn roles_and_recent_sign_in() {
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.body["recent_left_ms"].as_u64().unwrap() > 590_000);
     assert_eq!(a.send("GET", "/api/sensitive", None).await.status, StatusCode::OK);
-    let r = a.send("POST", "/auth/password", Some(json!({"new_password": "short"}))).await;
+    let r = a
+        .send(
+            "POST",
+            "/auth/password",
+            Some(json!({"current_password": "correct horse battery", "new_password": "short"})),
+        )
+        .await;
     assert_eq!(r.body["error"], "password_too_short");
+    let r = a
+        .send(
+            "POST",
+            "/auth/password",
+            Some(json!({"current_password": "correct horse battery", "new_password": "password1"})),
+        )
+        .await;
+    assert_eq!(r.body["error"], "password_too_common");
     let r = a.send("POST", "/auth/password", Some(json!({"new_password": "a much longer password"}))).await;
-    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(r.body["error"], "invalid_credentials", "the current password is needed");
+    let before = a.jar["__Host-doorward"].clone();
+    let r = a
+        .send(
+            "POST",
+            "/auth/password",
+            Some(json!({"current_password": "correct horse battery", "new_password": "a much longer password"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_ne!(a.jar["__Host-doorward"], before, "a new session cookie");
+    assert_eq!(a.send("GET", "/api/secret", None).await.text, "hello admin");
 }
 
 #[cfg(all(feature = "passkeys", feature = "test-util"))]

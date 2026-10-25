@@ -291,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_hash_never_verifies() {
+        let pw = Hasher::new(quick()).unwrap();
+        let phc = pw.hash("correct horse").unwrap();
+        let (head, out) = phc.rsplit_once('$').unwrap();
+        for i in 0..out.len() {
+            let mut b = out.as_bytes().to_vec();
+            b[i] = if b[i] == b'A' { b'B' } else { b'A' };
+            let changed = format!("{head}${}", String::from_utf8(b).unwrap());
+            assert_eq!(pw.verify("correct horse", Some(&changed)), Verdict::Wrong, "position {i}");
+        }
+    }
+
+    #[test]
     fn salts_are_fresh() {
         let pw = Hasher::new(quick()).unwrap();
         assert_ne!(pw.hash("same").unwrap(), pw.hash("same").unwrap());

@@ -520,11 +520,16 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn set_session_auth(&self, id: Uuid, auth_ms: i64) -> Result<(), StoreError> {
+    async fn reauth_session(&self, id: Uuid, token_hash: &[u8; 32], auth_ms: i64) -> Result<bool, StoreError> {
+        let h = *token_hash;
         self.run(move |c| {
-            c.execute("UPDATE auth_sessions SET auth_ms = ?2 WHERE id = ?1", params![id.to_string(), auth_ms])
+            let n = c
+                .execute(
+                    "UPDATE auth_sessions SET token_hash = ?2, auth_ms = ?3 WHERE id = ?1",
+                    params![id.to_string(), h.as_slice(), auth_ms],
+                )
                 .map_err(map_err)?;
-            Ok(())
+            Ok(n > 0)
         })
         .await
     }
