@@ -1,0 +1,46 @@
+[package]
+name = "doorward"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Headless sign-in for Rust web apps, starting with Argon2id password hashing sized to the machine"
+authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/ulrich-za/doorward"
+readme = "README.md"
+keywords = ["argon2", "password", "authentication", "login", "security"]
+categories = ["authentication", "cryptography", "web-programming"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE"]
+
+[features]
+default = ["serde", "tokio", "detect-memory"]
+serde = ["dep:serde", "dep:serde_json"]
+tokio = ["dep:tokio"]
+detect-memory = ["dep:sysinfo"]
+
+[dependencies]
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash", "zeroize"] }
+getrandom = "0.3.4"
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.145", optional = true }
+thiserror = "2.0.17"
+tokio = { version = "1.48", default-features = false, features = ["rt", "sync", "time"], optional = true }
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+zeroize = "1.8.2"
+
+# Memory is read directly on Linux; other systems ask the OS through sysinfo.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
