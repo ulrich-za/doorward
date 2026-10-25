@@ -30,8 +30,7 @@ const RETUNE_CHANGE: f64 = 0.2;
 /// Save it (it is small, and serialisable with the `serde` feature) and
 /// load it on the next start with [`HashPolicy::load_or_tune`], so the
 /// machine is timed only once. Where it is saved is up to the app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HashPolicy {
     /// Memory per check, in KiB.
     pub m_kib: u32,
@@ -124,7 +123,6 @@ impl HashPolicy {
     /// still fits this machine, otherwise a newly tuned one. The flag is
     /// `true` when the policy is new and should be saved. `force` always
     /// retunes. Blocks while tuning (see [`HashPolicy::tune`]).
-    #[cfg(feature = "serde")]
     pub fn load_or_tune(saved: Option<&str>, force: bool) -> Result<(HashPolicy, bool), Error> {
         let mem = detect_memory();
         if !force
@@ -137,14 +135,12 @@ impl HashPolicy {
     }
 
     /// The policy as a short JSON string, for saving.
-    #[cfg(feature = "serde")]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
 
     /// A saved policy, or `None` when it is unreadable or outside doorward's
     /// limits.
-    #[cfg(feature = "serde")]
     pub fn from_json(s: &str) -> Option<HashPolicy> {
         if s.len() > 4096 {
             return None;
@@ -293,7 +289,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serde")]
     #[test]
     fn saved_policies_round_trip_and_bad_ones_are_dropped() {
         let p = HashPolicy {

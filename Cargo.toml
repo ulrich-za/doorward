@@ -1,39 +1,70 @@
 [package]
 name = "doorward"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Headless sign-in for Rust web apps, starting with Argon2id password hashing sized to the machine"
+description = "Headless sign-in for Rust web apps: machine-sized Argon2id, passkeys, address-bound sessions, lockout-proof rate limits"
 authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/ulrich-za/doorward"
 readme = "README.md"
-keywords = ["argon2", "password", "authentication", "login", "security"]
+keywords = ["authentication", "passkeys", "webauthn", "argon2", "login"]
 categories = ["authentication", "cryptography", "web-programming"]
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE", "docs/*.md"]
+
+[workspace]
+members = ["."]
+# doorward-postgres uses sqlx, which Cargo won't resolve alongside rusqlite in
+# one dependency graph (both link SQLite), so it is a workspace of its own.
+exclude = ["doorward-postgres", "fuzz"]
 
 [features]
-default = ["serde", "tokio", "detect-memory"]
-serde = ["dep:serde", "dep:serde_json"]
-tokio = ["dep:tokio"]
+default = ["detect-memory"]
 detect-memory = ["dep:sysinfo"]
+passkeys = ["dep:webauthn-rs"]
+vendored-openssl = ["passkeys", "dep:openssl", "openssl/vendored"]
+axum = ["dep:axum"]
+test-util = ["dep:p256", "dep:ciborium"]
 
 [dependencies]
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash", "zeroize"] }
+async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
 getrandom = "0.3.4"
-serde = { version = "1.0.228", features = ["derive"], optional = true }
-serde_json = { version = "1.0.145", optional = true }
+http = "1.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
 thiserror = "2.0.17"
-tokio = { version = "1.48", default-features = false, features = ["rt", "sync", "time"], optional = true }
+tokio = { version = "1.48", default-features = false, features = ["rt", "sync", "time"] }
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
-zeroize = "1.8.2"
+unicode-normalization = "0.1.24"
+unicode-security = "0.1.2"
+uuid = { version = "1.18", default-features = false, features = ["serde", "std"] }
+zeroize = { version = "1.8.2", features = ["serde"] }
+
+axum = { version = "0.8.4", default-features = false, features = ["json", "query", "tokio"], optional = true }
+webauthn-rs = { version = "0.5.5", default-features = false, features = ["conditional-ui"], optional = true }
+openssl = { version = "0.10.73", optional = true }
+
+# test-util: a software passkey authenticator.
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"], optional = true }
+ciborium = { version = "0.2.2", optional = true }
 
 # Memory is read directly on Linux; other systems ask the OS through sysinfo.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.38", default-features = false, features = ["system"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tower = { version = "0.5.2", features = ["util"] }
+http-body-util = "0.1.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+axum = { version = "0.8.4", features = ["macros"] }
+
+[[example]]
+name = "minimal"
+required-features = ["axum", "passkeys"]
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -44,3 +75,8 @@ todo = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
+
+# Dependencies (Argon2, P-256, SHA-256) optimised in test builds, so tests run
+# at real speed; doorward's own code stays debuggable.
+[profile.dev.package."*"]
+opt-level = 2

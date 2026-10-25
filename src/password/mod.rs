@@ -95,7 +95,6 @@ struct Active {
 /// [`Hasher::verify_async`] do both.
 pub struct Hasher {
     active: RwLock<Active>,
-    #[cfg(feature = "tokio")]
     gate: tokio::sync::Semaphore,
 }
 
@@ -110,11 +109,7 @@ impl Hasher {
     /// blocks for one check.
     pub fn new(policy: HashPolicy) -> Result<Hasher, Error> {
         let dummy = make_dummy(&policy)?;
-        Ok(Hasher {
-            active: RwLock::new(Active { policy, dummy }),
-            #[cfg(feature = "tokio")]
-            gate: tokio::sync::Semaphore::new(2),
-        })
+        Ok(Hasher { active: RwLock::new(Active { policy, dummy }), gate: tokio::sync::Semaphore::new(2) })
     }
 
     /// The policy in force.
@@ -171,7 +166,6 @@ impl Hasher {
     /// Wait up to `wait` for a turn to hash or check a password. The policy
     /// allows one or two at once; the turn ends when the returned permit is
     /// dropped. `None` when the wait ran out (report the service as busy).
-    #[cfg(feature = "tokio")]
     pub async fn turn(&self, wait: std::time::Duration) -> Option<tokio::sync::SemaphorePermit<'_>> {
         let n = if self.policy().concurrency >= 2 { 1 } else { 2 };
         tokio::time::timeout(wait, self.gate.acquire_many(n)).await.ok()?.ok()
@@ -179,7 +173,6 @@ impl Hasher {
 
     /// [`Hasher::hash`] on a blocking thread, after waiting up to `wait` for a
     /// turn ([`Error::Busy`] when none came).
-    #[cfg(feature = "tokio")]
     pub async fn hash_async(
         self: &std::sync::Arc<Self>,
         password: Zeroizing<String>,
@@ -192,7 +185,6 @@ impl Hasher {
 
     /// [`Hasher::verify`] on a blocking thread, after waiting up to `wait` for
     /// a turn ([`Verdict::Busy`] when none came).
-    #[cfg(feature = "tokio")]
     pub async fn verify_async(
         self: &std::sync::Arc<Self>,
         password: Zeroizing<String>,
@@ -375,7 +367,6 @@ mod tests {
         assert!(!s.contains("argon2id$"), "{s}");
     }
 
-    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn turns_limit_concurrency() {
         use std::time::Duration;
