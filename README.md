@@ -6,74 +6,119 @@ Headless sign-in for Rust web apps. doorward is the doorkeeper: it answers
 The name is the old English word for a doorkeeper, the job Háma holds at the
 doors of Théoden's hall.
 
-## This release
+## What it does
 
-0.1.0 contains the first piece: **Argon2id password hashing sized to the
-machine it runs on**. It is the hashing pingrail 0.3 uses, moved into a
-library unchanged in behaviour.
+- **Passwords** hashed with Argon2id sized to the machine (19–256 MiB, about a
+  third of a second per check, never below OWASP's minimum), checked against
+  the 5,000 most common passwords, with no composition rules.
+- **Passkeys** (WebAuthn through webauthn-rs) per address, with user
+  verification always required, discoverable sign-in (no username needed),
+  and browser autofill.
+- **Addresses** the app answers on, each with its own sign-in methods and
+  session lengths. A LAN name and a public name behind cloudflared can
+  behave differently, and a LAN device that claims the public name gets
+  nothing.
+- **Sessions** stored only as hashes, bound to the address they were made
+  on, with idle and absolute limits, `__Host-` cookies, a new cookie at every
+  sign-in and confirmation, and a list the user can end sessions from.
+- **Recent sign-in** before sensitive actions, confirmed with the password
+  or a passkey.
+- **Rate limits nobody can use to lock you out:** each visitor (an IPv4
+  address or IPv6 /64) has its own budget, accounts are never locked, and a
+  browser that signed in before has its own budget and a reserved
+  password-check slot, so a flood from elsewhere — even from your own
+  address — can't stop you.
+- **A security log** of sign-ins, failures and changes, per user and on its
+  own `tracing` target.
+- **axum integration:** extractors (`Authenticated`, `Recent`), role
+  middleware, and ready-made JSON endpoints for sign-in, sessions and
+  passkeys.
+- **Storage** behind a trait: in memory (tests), SQLite (`doorward-sqlite`)
+  and Postgres (`doorward-postgres`), each passing the same conformance suite.
 
-- **Memory per check** is chosen from the machine: 2 % of total memory or
-  10 % of free memory, whichever is smaller, split between two checks at a time
-  when each still gets 32 MiB, and held to 19–256 MiB per check. On Linux the
-  limits of a container or systemd service are honoured.
-- **Passes** are timed on the machine so a check takes about a third of a
-  second, never below OWASP's minimum (19 MiB with 2 passes, or 46 MiB with 1).
-- **The chosen settings are saved by the app** and reused. They are timed again
-  when total memory changes by more than a fifth, or on request.
-- **Saved hashes keep working** after the settings change, and are reported as
-  needing a rehash at their next successful sign-in.
-- **Unknown users take as long** as real ones: a stand-in hash is checked.
-- **One or two checks at a time** (with the `tokio` feature), so a flood of
-  sign-ins can use at most 512 MiB, whatever happens.
-- **Tampered or corrupt saved hashes** that ask for absurd work are refused
-  rather than tried, and passwords over 1 KiB are refused before hashing.
+No `unsafe` code. No server secret to leak or rotate.
 
-```rust,no_run
-use doorward::password::{HashPolicy, Hasher, Verdict};
+## A taste
 
-fn main() -> Result<(), doorward::Error> {
-    let saved: Option<String> = None; // wherever your app keeps settings
+```rust
+use axum::{Router, routing::get};
+use doorward::axum::{Authenticated, routes};
+use doorward::{Address, Doorward};
 
-    // Reuse the saved policy, or time this machine (a second or two).
-    let (policy, changed) = HashPolicy::load_or_tune(saved.as_deref(), false)?;
-    if changed {
-        // save policy.to_json()
-    }
-    println!("password hashing: {}", policy.describe());
+async fn dashboard(me: Authenticated) -> String {
+    format!("hello {}", me.session.user.display_name)
+}
 
-    let hasher = Hasher::new(policy)?;
-    let phc = hasher.hash("correct horse battery staple")?;
-    match hasher.verify("correct horse battery staple", Some(&phc)) {
-        Verdict::Good { rehash } => { /* signed in; if rehash, hash again and save */ }
-        Verdict::Wrong => { /* refuse */ }
-        Verdict::Busy => { /* not enough memory right now: ask to retry */ }
-    }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dw = Doorward::builder(doorward_sqlite::SqliteStore::open("app.db")?)
+        .address(Address::new("https://app.example")?.passkeys(true))
+        .app_name("my app")
+        .build()
+        .await?;
+    let app = Router::new()
+        .route("/api/dashboard", get(dashboard))
+        .nest("/auth", routes())
+        .with_state(dw);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8443").await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }
 ```
 
-In an async server, use `Hasher::verify_async` and `Hasher::hash_async`: they
-wait for a turn and run the check on a blocking thread.
+Try it in a browser with the example:
 
-## Features
+```text
+cargo run --example minimal --features axum,passkeys
+```
+
+## Crates
+
+| Crate | What |
+|---|---|
+| `doorward` | The core: hashing, sign-in, sessions, limits, passkeys (`passkeys`), axum (`axum`) |
+| `doorward-sqlite` | SQLite storage through rusqlite (shares SQLite with apps on rusqlite 0.40–0.41) |
+| `doorward-postgres` | Postgres storage through sqlx 0.9 (the app's pool and TLS) |
+
+`doorward-postgres` is a workspace of its own: Cargo won't resolve rusqlite
+and sqlx in one dependency graph, even when one of them is unused.
+
+## Features of `doorward`
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `serde` | yes | `HashPolicy::load_or_tune`, `to_json`, `from_json` |
-| `tokio` | yes | `Hasher::turn`, `verify_async`, `hash_async` |
-| `detect-memory` | yes | Memory detection on systems other than Linux (through `sysinfo`) |
+| `detect-memory` | yes | Memory detection on systems other than Linux, through `sysinfo` |
+| `passkeys` | | Passkeys through webauthn-rs 0.5 (uses OpenSSL) |
+| `vendored-openssl` | | Builds OpenSSL into the program |
+| `axum` | | Extractors, middleware and JSON endpoints for axum 0.8 |
+| `test-util` | | The store conformance suite and a software passkey authenticator |
 
-doorward contains no `unsafe` code (`#![forbid(unsafe_code)]`).
+## Documentation
 
-## What comes next
+- [Integration guide](docs/integration.md), including moving pingrail 0.3's
+  accounts and passkeys across.
+- [Threat model](docs/threat-model.md): what is defended, how, and where it
+  stops.
+- [OWASP ASVS 5.0 checklist](docs/asvs.md): each requirement and the test
+  that checks it.
+- [CHANGELOG](CHANGELOG.md).
 
-Passkeys, sessions bound to the address they were made on, per-visitor rate
-limits that nobody can use to lock you out, trusted devices and the rest of
-sign-in. See the CHANGELOG for what each release contains.
+## Testing
+
+```text
+cargo test --workspace --all-features
+DOORWARD_TEST_POSTGRES=postgres://… cargo test --manifest-path doorward-postgres/Cargo.toml
+python3 tests/browser/passkeys.py   # with the example running; needs Playwright
+cargo deny check
+```
+
+Thorough testing is not an independent audit. Have one done before a public,
+multi-user site goes live.
 
 ## Licence
 
 Copyright 2026 Ulrich Holtzhausen. Licensed under the
-[Apache License, Version 2.0](LICENSE).
+[Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for the
+common-password list's licence.
 
 Report security problems as described in [SECURITY.md](SECURITY.md).

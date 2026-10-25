@@ -46,11 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    let password = std::env::var("DEMO_PASSWORD").unwrap_or_else(|_| {
-        let mut b = [0u8; 12];
-        getrandom::fill(&mut b).expect("random");
-        b.iter().map(|x| format!("{x:02x}")).collect()
-    });
+    let password = match std::env::var("DEMO_PASSWORD") {
+        Ok(p) => p,
+        Err(_) => {
+            let mut b = [0u8; 12];
+            getrandom::fill(&mut b).map_err(|e| format!("random: {e}"))?;
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+    };
     dw.create_user(NewUser {
         username: "admin".into(),
         display_name: Some("Demo Admin".into()),

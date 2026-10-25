@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, for new advisories
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path doorward-postgres/Cargo.toml --check
+      - run: cargo clippy --workspace --all-targets --features axum,passkeys,test-util,fuzzing
+      - run: cargo clippy -p doorward --all-targets --no-default-features
+      - run: cargo clippy --manifest-path doorward-postgres/Cargo.toml --all-targets
+      - run: cargo doc --workspace --no-deps --features axum,passkeys,test-util
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - run: cargo test --workspace --features axum,passkeys,vendored-openssl,test-util
+      - run: cargo test -p doorward --no-default-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --features axum,passkeys,test-util
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: doorward
+          POSTGRES_PASSWORD: doorward-test
+          POSTGRES_DB: doorward_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U doorward" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: doorward-postgres
+      - run: cargo test --manifest-path doorward-postgres/Cargo.toml
+        env:
+          DOORWARD_TEST_POSTGRES: postgres://doorward:doorward-test@localhost/doorward_test
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: doorward-postgres/Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+      - run: cargo audit --file doorward-postgres/Cargo.lock
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright && python -m playwright install --with-deps chromium
+      - run: cargo build --example minimal --features axum,passkeys
+      - name: Real-browser passkey check
+        run: |
+          DEMO_PASSWORD='demo password 123' target/debug/examples/minimal > app.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:3000/auth/session > /dev/null && break; sleep 1; done
+          APP_LOG=app.log python tests/browser/passkeys.py
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: |
+          cd fuzz
+          for t in request_headers names password_hashes; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=60
+          done
