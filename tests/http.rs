@@ -326,3 +326,23 @@ async fn passkeys_over_http() {
     let r = c.send("DELETE", &format!("/auth/passkeys/{id}"), None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn nothing_is_cacheable() {
+    let e = env().await;
+    e.user("admin", Some("correct horse battery")).await;
+    let mut c = Client::new(&e.dw);
+    let r = c.send("GET", "/auth/sessions", None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "errors too");
+    let r =
+        c.send("POST", "/auth/sign-in", Some(json!({"username": "admin", "password": "correct horse battery"}))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    for path in ["/auth/session", "/auth/sessions", "/auth/events", "/auth/passkeys"] {
+        let r = c.send("GET", path, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{path}");
+    }
+    let r = c.send("POST", "/auth/sessions/end-others", None).await;
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+}

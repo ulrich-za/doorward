@@ -26,9 +26,9 @@ pub fn cookie(h: &HeaderMap, name: &str) -> Option<String> {
     crate::net::cookie(h, name)
 }
 
-pub fn client_ip(peer: IpAddr, h: &HeaderMap) -> IpAddr {
+pub fn client_ip(peer: IpAddr, h: &HeaderMap, cf: bool) -> IpAddr {
     let trusted = [crate::net::IpNet::parse("127.0.0.0/8").unwrap_or_else(|_| unreachable!())];
-    crate::net::client_ip(peer, h, &trusted)
+    crate::net::client_ip(peer, h, &trusted, cf)
 }
 
 pub fn same_origin(h: &HeaderMap) -> bool {

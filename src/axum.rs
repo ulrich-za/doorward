@@ -354,7 +354,12 @@ where
         .route("/passkeys/register/start", post(passkeys::register_start))
         .route("/passkeys/register/finish", post(passkeys::register_finish))
         .route("/passkeys/{id}", axum::routing::patch(passkeys::rename).delete(passkeys::remove));
-    r.layer(DefaultBodyLimit::max(64 * 1024))
+    r.layer(DefaultBodyLimit::max(64 * 1024)).layer(axum::middleware::map_response(never_cache))
+}
+
+/// Every answer from these endpoints is about one visitor: never cache it.
+async fn never_cache(r: Response) -> Response {
+    no_store(r)
 }
 
 async fn get_session<S>(State(state): State<S>, Visitor(v): Visitor) -> Result<Response, AuthError>

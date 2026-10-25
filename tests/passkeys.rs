@@ -374,7 +374,7 @@ async fn open_requests_are_capped_per_visitor() {
         }
         assert!(n <= 1000);
     }
-    assert_eq!(n, 32);
+    assert_eq!(n, 8);
     // Someone else still gets a request.
     assert!(e.dw.passkey_sign_in_start(&Browser::public("203.0.113.9").post(&e.dw)).await.is_ok());
     e.clock.advance(Duration::from_secs(120));
@@ -395,4 +395,69 @@ async fn admin_reset_removes_every_passkey() {
     assert!(e.dw.user_passkeys(u.id).await.unwrap().is_empty());
     assert!(e.dw.authenticate(&pk.get(&e.dw)).await.unwrap().is_none(), "passkey sessions end");
     assert!(e.dw.authenticate(&b.get(&e.dw)).await.unwrap().is_some(), "password sessions stay");
+}
+
+// ----- found in the review before 0.1.0, kept as regression tests ------------------
+
+#[tokio::test]
+async fn open_requests_are_capped_per_network() {
+    let e = env().await;
+    // A hundred /64s in one /48.
+    let mut n = 0;
+    for net in 0..100u32 {
+        let b = Browser::public(&format!("2001:db8:1:{net:x}::1"));
+        for _ in 0..8 {
+            if e.dw.passkey_sign_in_start(&b.post(&e.dw)).await.is_ok() {
+                n += 1;
+            }
+        }
+    }
+    assert_eq!(n, 64);
+    assert!(e.dw.passkey_sign_in_start(&Browser::public("2001:db8:2::1").post(&e.dw)).await.is_ok(), "another /48");
+}
+
+#[tokio::test]
+async fn starting_a_passkey_sign_in_counts_against_the_budget() {
+    let e = env_with(|b| {
+        b.limits(doorward::Limits { visitor_burst: 3, visitor_refill: Duration::from_secs(60), ..Default::default() })
+    })
+    .await;
+    let b = Browser::public("198.51.100.7");
+    for _ in 0..3 {
+        e.dw.passkey_sign_in_start(&b.post(&e.dw)).await.unwrap();
+    }
+    assert!(matches!(e.dw.passkey_sign_in_start(&b.post(&e.dw)).await, Err(Error::TooManyAttempts { .. })));
+}
+
+#[tokio::test]
+async fn account_holders_cant_block_the_owners_passkey_sign_in() {
+    let e = env().await;
+    e.user("owner", Some("blue tractor umbrella")).await;
+    e.user("mallory", Some("green ladder piano")).await;
+    let mut owner = Browser::public("203.0.113.10");
+    let s = e.dw.sign_in_password(&owner.post(&e.dw), "owner", "blue tractor umbrella", false).await.unwrap();
+    owner.take(&s.cookies);
+    owner.jar.remove("__Host-doorward");
+
+    // Mallory collects twenty device cookies, from twenty networks.
+    let mut minted = Vec::new();
+    for i in 0..20u32 {
+        let mut b = Browser::public(&format!("198.51.{i}.1"));
+        let s = e.dw.sign_in_password(&b.post(&e.dw), "mallory", "green ladder piano", false).await.unwrap();
+        b.take(&s.cookies);
+        b.jar.remove("__Host-doorward");
+        minted.push(b);
+    }
+    let mut n = 0;
+    for b in &minted {
+        for _ in 0..10 {
+            if e.dw.passkey_sign_in_start(&b.post(&e.dw)).await.is_ok() {
+                n += 1;
+            }
+        }
+    }
+    // Her five remembered browsers share one account's 8; the fifteen
+    // forgotten ones are ordinary visitors with 8 each.
+    assert_eq!(n, 8 + 15 * 8);
+    assert!(e.dw.passkey_sign_in_start(&owner.post(&e.dw)).await.is_ok(), "the owner still starts one");
 }

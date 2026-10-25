@@ -223,6 +223,9 @@ pub trait Store: Send + Sync + 'static {
     async fn delete_remembered(&self, token_hash: &[u8; 32]) -> Result<(), StoreError>;
     /// Forget all of a user's remembered browsers.
     async fn delete_remembered_for_user(&self, user_id: Uuid) -> Result<u64, StoreError>;
+    /// Keep a user's `keep` newest remembered browsers (by `created_ms`) and
+    /// forget the rest. Returns how many were forgotten.
+    async fn trim_remembered(&self, user_id: Uuid, keep: u32) -> Result<u64, StoreError>;
     /// Remove remembered browsers that have expired by `now_ms`.
     async fn prune_remembered(&self, now_ms: i64) -> Result<u64, StoreError>;
 

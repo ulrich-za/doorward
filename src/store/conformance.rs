@@ -149,7 +149,10 @@ async fn users<S: Store + ?Sized>(s: &S) {
 
 async fn passwords<S: Store + ?Sized>(s: &S) {
     let u = user(&format!("Pw{}", rand_suffix()));
+    let other = user(&format!("Pwo{}", rand_suffix()));
     s.insert_user(&u).await.unwrap();
+    s.insert_user(&other).await.unwrap();
+    s.set_password(other.id, "$argon2id$other", 1).await.unwrap();
     assert_eq!(s.password(u.id).await.unwrap(), None);
     s.set_password(u.id, "$argon2id$one", 1).await.unwrap();
     s.set_password(u.id, "$argon2id$two", 2).await.unwrap();
@@ -163,11 +166,17 @@ async fn passwords<S: Store + ?Sized>(s: &S) {
     assert_eq!(s.password(u.id).await.unwrap(), None);
     assert!(!s.replace_password(u.id, "$argon2id$three", "x", 4).await.unwrap(), "no password to replace");
     assert!(s.set_password(uuid(), "$argon2id$x", 1).await.is_err(), "unknown user");
+    assert_eq!(s.password(other.id).await.unwrap().as_deref(), Some("$argon2id$other"), "only the user's own");
 }
 
 async fn sessions<S: Store + ?Sized>(s: &S) {
     let u = user(&format!("Sess{}", rand_suffix()));
     s.insert_user(&u).await.unwrap();
+    // Someone else's session, which nothing below may list or end.
+    let other = user(&format!("Sesso{}", rand_suffix()));
+    s.insert_user(&other).await.unwrap();
+    let theirs = SessionRecord { idle_ms: None, max_ms: 1_000_000_000, ..session(other.id, 1_500) };
+    s.insert_session(&theirs).await.unwrap();
     let a = session(u.id, 1_000);
     let mut b = session(u.id, 2_000);
     b.idle_ms = None;
@@ -220,6 +229,17 @@ async fn sessions<S: Store + ?Sized>(s: &S) {
     s.insert_session(&session(u.id, 400)).await.unwrap();
     assert_eq!(s.delete_sessions_for_user(u.id, None).await.unwrap(), 1);
     assert!(s.sessions_for_user(u.id).await.unwrap().is_empty());
+
+    // Per-user queries and deletes touch only that user's sessions.
+    let theirs_now = s.session_by_token(&theirs.token_hash).await.unwrap();
+    assert_eq!(theirs_now.map(|x| x.id), Some(theirs.id), "someone else's session is untouched");
+    assert_eq!(s.sessions_for_user(other.id).await.unwrap().iter().map(|x| x.id).collect::<Vec<_>>(), vec![theirs.id]);
+    let mine = session(u.id, 500);
+    s.insert_session(&mine).await.unwrap();
+    assert_eq!(s.sessions_for_user(u.id).await.unwrap().iter().map(|x| x.id).collect::<Vec<_>>(), vec![mine.id]);
+    assert_eq!(s.delete_sessions_for_user(other.id, None).await.unwrap(), 1);
+    assert!(s.session_by_token(&mine.token_hash).await.unwrap().is_some());
+    assert_eq!(s.delete_sessions_for_user(u.id, None).await.unwrap(), 1);
 }
 
 async fn remembered<S: Store + ?Sized>(s: &S) {
@@ -240,14 +260,41 @@ async fn remembered<S: Store + ?Sized>(s: &S) {
     assert_eq!(s.prune_remembered(5_000).await.unwrap(), 1);
     assert_eq!(s.remembered(&r.token_hash).await.unwrap(), None);
 
-    let x = RememberedRecord { token_hash: hash32(), user_id: u.id, created_ms: 1, last_used_ms: 1, expires_ms: 9_999 };
-    let y = RememberedRecord { token_hash: hash32(), ..x.clone() };
+    let other = user(&format!("Remo{}", rand_suffix()));
+    s.insert_user(&other).await.unwrap();
+    let rec = |user_id: Uuid, created: i64| RememberedRecord {
+        token_hash: hash32(),
+        user_id,
+        created_ms: created,
+        last_used_ms: created,
+        expires_ms: 9_999,
+    };
+    let theirs = rec(other.id, 1);
+    s.insert_remembered(&theirs).await.unwrap();
+
+    let x = rec(u.id, 1);
+    let y = rec(u.id, 1);
     s.insert_remembered(&x).await.unwrap();
     s.insert_remembered(&y).await.unwrap();
     s.delete_remembered(&x.token_hash).await.unwrap();
     assert_eq!(s.remembered(&x.token_hash).await.unwrap(), None);
     assert_eq!(s.delete_remembered_for_user(u.id).await.unwrap(), 1);
     assert_eq!(s.remembered(&y.token_hash).await.unwrap(), None);
+    assert!(s.remembered(&theirs.token_hash).await.unwrap().is_some(), "only the user's own are forgotten");
+
+    // Keep the newest few.
+    let five: Vec<RememberedRecord> = (1..=5).map(|i| rec(u.id, 100 * i)).collect();
+    for r in &five {
+        s.insert_remembered(r).await.unwrap();
+    }
+    assert_eq!(s.trim_remembered(u.id, 2).await.unwrap(), 3);
+    for (i, r) in five.iter().enumerate() {
+        assert_eq!(s.remembered(&r.token_hash).await.unwrap().is_some(), i >= 3, "the two newest stay ({i})");
+    }
+    assert_eq!(s.trim_remembered(u.id, 2).await.unwrap(), 0);
+    assert!(s.remembered(&theirs.token_hash).await.unwrap().is_some(), "someone else's are untouched");
+    assert_eq!(s.trim_remembered(u.id, 0).await.unwrap(), 2);
+    assert_eq!(s.delete_remembered_for_user(other.id).await.unwrap(), 1);
 }
 
 async fn passkeys<S: Store + ?Sized>(s: &S) {
@@ -313,6 +360,9 @@ async fn events<S: Store + ?Sized>(s: &S) {
     s.insert_event(&EventRecord { user_id: None, address: None, ip: None, detail: None, ..e(250, "anonymous") })
         .await
         .unwrap();
+    let other = user(&format!("Evo{}", rand_suffix()));
+    s.insert_user(&other).await.unwrap();
+    s.insert_event(&EventRecord { user_id: Some(other.id), ..e(150, "theirs") }).await.unwrap();
     let got = s.events_for_user(u.id, 10).await.unwrap();
     assert_eq!(got.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>(), vec!["passkey_added", "sign_out", "sign_in"]);
     assert_eq!(got[2].detail.as_deref(), Some("{\"method\":\"password\"}"));

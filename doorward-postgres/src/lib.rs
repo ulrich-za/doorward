@@ -564,6 +564,20 @@ impl Store for PostgresStore {
         Ok(r.rows_affected())
     }
 
+    async fn trim_remembered(&self, user_id: Uuid, keep: u32) -> Result<u64, StoreError> {
+        let r = sqlx::query(
+            "DELETE FROM auth_remembered WHERE user_id = $1 AND token_hash NOT IN (
+                 SELECT token_hash FROM auth_remembered WHERE user_id = $1
+                 ORDER BY created_ms DESC, token_hash DESC LIMIT $2)",
+        )
+        .bind(user_id)
+        .bind(i64::from(keep))
+        .execute(&self.pool)
+        .await
+        .map_err(map_err)?;
+        Ok(r.rows_affected())
+    }
+
     async fn prune_remembered(&self, now_ms: i64) -> Result<u64, StoreError> {
         let r = sqlx::query("DELETE FROM auth_remembered WHERE expires_ms <= $1")
             .bind(now_ms)

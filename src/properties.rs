@@ -68,13 +68,24 @@ proptest! {
     #[test]
     fn client_addresses_come_only_from_trusted_proxies(
         cf in ".{0,60}", xff in ".{0,120}", peer in any::<[u8; 4]>(), trusted_bit in any::<bool>(),
+        cloudflare in any::<bool>(),
     ) {
         let peer = IpAddr::from(peer);
         let trusted = if trusted_bit { vec![IpNet::parse(&peer.to_string()).unwrap()] } else { vec![] };
         let m = headers(&[("cf-connecting-ip", cf), ("x-forwarded-for", xff)]);
-        let ip = net::client_ip(peer, &m, &trusted);
+        let ip = net::client_ip(peer, &m, &trusted, cloudflare);
         if !trusted_bit {
             prop_assert_eq!(ip, peer);
+        }
+        if !cloudflare {
+            // CF-Connecting-IP makes no difference unless the proxy is Cloudflare's.
+            let mut without = m.clone();
+            without.remove("cf-connecting-ip");
+            prop_assert_eq!(ip, net::client_ip(peer, &without, &trusted, false));
+            prop_assert_eq!(
+                net::through_proxy(peer, &m, &trusted, false),
+                net::through_proxy(peer, &without, &trusted, false)
+            );
         }
         let _ = VisitorKey::of(ip);
     }
@@ -129,7 +140,7 @@ proptest! {
         let mut now = 0i64;
         for (op, who, step) in ops {
             now += step;
-            let w = if who % 5 == 0 { Who::Remembered([who; 32]) } else { Who::Visitor(VisitorKey::of(IpAddr::from([10, 0, 0, who]))) };
+            let w = if who % 5 == 0 { Who::Remembered(uuid::Uuid::from_u128(who as u128)) } else { Who::Visitor(VisitorKey::of(IpAddr::from([10, 0, 0, who]))) };
             match op {
                 0 | 1 => {
                     if let Ok(d) = l.admit(w, now) {

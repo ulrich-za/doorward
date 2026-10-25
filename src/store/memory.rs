@@ -275,6 +275,18 @@ impl Store for MemoryStore {
         Ok((before - s.remembered.len()) as u64)
     }
 
+    async fn trim_remembered(&self, user_id: Uuid, keep: u32) -> Result<u64, StoreError> {
+        let mut s = self.lock();
+        let mut mine: Vec<(i64, [u8; 32])> =
+            s.remembered.values().filter(|r| r.user_id == user_id).map(|r| (r.created_ms, r.token_hash)).collect();
+        mine.sort_unstable_by(|a, b| b.cmp(a));
+        let forget: Vec<[u8; 32]> = mine.into_iter().skip(keep as usize).map(|(_, h)| h).collect();
+        for h in &forget {
+            s.remembered.remove(h);
+        }
+        Ok(forget.len() as u64)
+    }
+
     async fn prune_remembered(&self, now_ms: i64) -> Result<u64, StoreError> {
         let mut s = self.lock();
         let before = s.remembered.len();

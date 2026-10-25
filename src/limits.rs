@@ -6,7 +6,9 @@
 //! - A visitor that keeps failing is slowed, then refused for a while.
 //! - A *remembered browser* (one that signed in before, holding the device
 //!   cookie) has its own budget and skips the per-visitor slow-down, so a
-//!   flood from elsewhere — even from the same address — can't reach it.
+//!   flood from elsewhere — even from the same address — can't reach it. The
+//!   budget belongs to the account, shared by all its remembered browsers,
+//!   and only counts attempts at that same account.
 //! - Accounts are never locked: a lock that follows failures can be set off
 //!   by anyone who knows a username.
 //! - The only global limit is on CPU: one or two password checks at a time
@@ -20,6 +22,7 @@ use std::time::Duration;
 use crate::clock::ms;
 use crate::error::Error;
 use crate::net::VisitorKey;
+use uuid::Uuid;
 
 /// Rate-limit settings. The defaults suit a small office behind one address
 /// as well as a single owner reached over the internet.
@@ -47,7 +50,9 @@ pub struct Limits {
     pub remembered_refill: Duration,
     /// Failures within `window` before a remembered browser is refused.
     pub remembered_refuse_after: u32,
-    /// Most visitors (and, separately, remembered browsers) tracked at once.
+    /// Most visitors (and, separately, accounts with remembered browsers)
+    /// tracked at once. Visitors being refused are kept beyond this, up to
+    /// twice as many.
     pub tracked_max: usize,
 }
 
@@ -88,8 +93,8 @@ impl Limits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Who {
     Visitor(VisitorKey),
-    /// The SHA-256 of a valid remembered-browser cookie.
-    Remembered([u8; 32]),
+    /// An attempt at this account, from one of its remembered browsers.
+    Remembered(Uuid),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,27 +134,41 @@ struct Table<K> {
 impl<K: Eq + Hash + Copy> Table<K> {
     fn entry(&mut self, k: K, burst: u32, refill_ms: i64, window_ms: i64, max: usize, now: i64) -> &mut Entry {
         if !self.map.contains_key(&k) && self.map.len() >= max {
-            // Forget idle visitors first; then the tenth seen longest ago
-            // among those with no recent failures; only then anyone. A flood
-            // of fresh addresses can't wash out a visitor that is refused.
-            self.map.retain(|_, e| !e.clean(burst, refill_ms, window_ms, now));
-            if self.map.len() >= max {
-                let harmless =
-                    |e: &Entry| e.refused_until_ms <= now && (e.failures == 0 || now - e.last_failure_ms >= window_ms);
-                let mut ages: Vec<(i64, K)> =
-                    self.map.iter().filter(|(_, e)| harmless(e)).map(|(k, e)| (e.seen_ms, *k)).collect();
-                if ages.is_empty() {
-                    ages = self.map.iter().map(|(k, e)| (e.seen_ms, *k)).collect();
-                }
-                ages.sort_by_key(|(seen, _)| *seen);
-                for (_, k) in ages.into_iter().take((max / 10).max(1)) {
-                    self.map.remove(&k);
-                }
-            }
+            self.make_room(burst, refill_ms, window_ms, max, now);
         }
         let e = self.map.entry(k).or_insert_with(|| Entry::new(burst, now));
         e.seen_ms = now;
         e
+    }
+
+    /// Forget idle entries first; then a tenth of the rest that aren't
+    /// refused, those without recent failures and seen longest ago first.
+    /// Refused entries are never forgotten while there are others, so a
+    /// flood of fresh addresses can't wash out a visitor that is refused;
+    /// the table may then grow to twice `max`, and only beyond that are the
+    /// refusals that end soonest forgotten (which keeps memory bounded).
+    fn make_room(&mut self, burst: u32, refill_ms: i64, window_ms: i64, max: usize, now: i64) {
+        self.map.retain(|_, e| !e.clean(burst, refill_ms, window_ms, now));
+        if self.map.len() < max {
+            return;
+        }
+        let tenth = (max / 10).max(1);
+        let mut candidates: Vec<((bool, i64), K)> = self
+            .map
+            .iter()
+            .filter(|(_, e)| e.refused_until_ms <= now)
+            .map(|(k, e)| ((e.failures > 0 && now - e.last_failure_ms < window_ms, e.seen_ms), *k))
+            .collect();
+        if candidates.is_empty() {
+            if self.map.len() < max.saturating_mul(2) {
+                return;
+            }
+            candidates = self.map.iter().map(|(k, e)| ((false, e.refused_until_ms), *k)).collect();
+        }
+        candidates.sort_by_key(|(order, _)| *order);
+        for (_, k) in candidates.into_iter().take(tenth) {
+            self.map.remove(&k);
+        }
     }
 }
 
@@ -157,7 +176,7 @@ impl<K: Eq + Hash + Copy> Table<K> {
 pub(crate) struct Limiter {
     limits: Limits,
     visitors: Mutex<Table<VisitorKey>>,
-    remembered: Mutex<Table<[u8; 32]>>,
+    remembered: Mutex<Table<Uuid>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -337,7 +356,7 @@ mod tests {
     #[test]
     fn remembered_browsers_have_their_own_budget_and_no_slow_down() {
         let l = Limiter::new(Limits::default());
-        let me = Who::Remembered([7; 32]);
+        let me = Who::Remembered(Uuid::from_u128(7));
         // The attacker shares my address and has exhausted it.
         for i in 0..40 {
             let _ = l.admit(v(1), i);
@@ -345,7 +364,8 @@ mod tests {
         }
         assert!(l.admit(v(1), 100).is_err());
         assert_eq!(l.admit(me, 100).unwrap(), Duration::ZERO);
-        // A stolen remembered cookie still runs out, and is refused after 10 failures.
+        // A stolen remembered cookie still runs out, and the account's
+        // remembered browsers are refused after 10 failures.
         for i in 0..9 {
             l.failed(me, 200 + i);
         }
@@ -372,6 +392,40 @@ mod tests {
         assert!(l.admit(bad, 10_000).is_err(), "still refused: entries with failures outlive clean ones");
         l.tidy(10_000_000);
         assert_eq!(l.tracked(), (0, 0));
+    }
+
+    #[test]
+    fn a_failing_flood_cant_wash_out_a_refused_visitor() {
+        let l = Limiter::new(Limits { tracked_max: 100, ..Limits::default() });
+        let bad = Who::Visitor(VisitorKey::of("2001:db8:ffff::1".parse().unwrap()));
+        for i in 0..20 {
+            let _ = l.admit(bad, i);
+            l.failed(bad, i);
+        }
+        assert!(l.admit(bad, 100).is_err());
+        // Thousands of other /64s, each failing once.
+        for i in 0..5_000u32 {
+            let ip = std::net::IpAddr::from(
+                (0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + ((i as u128) << 64)).to_be_bytes(),
+            );
+            let w = Who::Visitor(VisitorKey::of(ip));
+            let _ = l.admit(w, 1_000 + i as i64);
+            l.failed(w, 1_000 + i as i64);
+        }
+        assert!(l.tracked().0 <= 100);
+        assert!(l.admit(bad, 10_000).is_err(), "still refused");
+    }
+
+    #[test]
+    fn refused_entries_stay_bounded() {
+        let l = Limiter::new(Limits { tracked_max: 100, refuse_after: 1, ..Limits::default() });
+        // Every visitor in the flood gets itself refused.
+        for i in 0..1_000u32 {
+            let w = Who::Visitor(VisitorKey::of(std::net::IpAddr::from((0x0a00_0000u32 + i).to_be_bytes())));
+            let _ = l.admit(w, i as i64);
+            l.failed(w, i as i64);
+        }
+        assert!(l.tracked().0 <= 200, "{}", l.tracked().0);
     }
 
     #[test]

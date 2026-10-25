@@ -35,7 +35,9 @@ mod policy;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
 use argon2::{Argon2, Params, Version};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
 use crate::error::Error;
@@ -84,18 +86,22 @@ struct Active {
     /// A stand-in hash that unknown usernames are checked against, so they
     /// take as long as real ones.
     dummy: String,
+    /// How long making the stand-in took, in milliseconds.
+    dummy_ms: u64,
 }
 
 /// Hashes and checks passwords with the policy in force.
 ///
 /// The hashing calls block for about a third of a second each: run them on a
-/// blocking thread. With the `tokio` feature, [`Hasher::turn`] limits how many
-/// run at once to the policy's concurrency (one or two), which bounds the
-/// memory a flood of sign-ins can use; [`Hasher::hash_async`] and
-/// [`Hasher::verify_async`] do both.
+/// blocking thread. [`Hasher::turn`] limits how many run at once to the
+/// policy's concurrency (one or two), which bounds the memory a flood of
+/// sign-ins can use; [`Hasher::hash_async`] and [`Hasher::verify_async`] do
+/// both, and hold the turn until the hashing itself has finished, even if
+/// the caller gives up waiting (a visitor who hangs up can't free a turn
+/// while their check still runs).
 pub struct Hasher {
     active: RwLock<Active>,
-    gate: tokio::sync::Semaphore,
+    gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for Hasher {
@@ -108,8 +114,11 @@ impl Hasher {
     /// A hasher for `policy`. Hashes one random stand-in password, so this
     /// blocks for one check.
     pub fn new(policy: HashPolicy) -> Result<Hasher, Error> {
-        let dummy = make_dummy(&policy)?;
-        Ok(Hasher { active: RwLock::new(Active { policy, dummy }), gate: tokio::sync::Semaphore::new(2) })
+        let (dummy, dummy_ms) = make_dummy(&policy)?;
+        Ok(Hasher {
+            active: RwLock::new(Active { policy, dummy, dummy_ms }),
+            gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        })
     }
 
     /// The policy in force.
@@ -120,10 +129,19 @@ impl Hasher {
     /// Switch to a newly tuned policy. Saved hashes keep working; each one is
     /// reported as needing a rehash at its next successful check.
     pub fn replace(&self, policy: HashPolicy) -> Result<(), Error> {
-        let dummy = make_dummy(&policy)?;
+        let (dummy, dummy_ms) = make_dummy(&policy)?;
         let mut w = self.active.write().unwrap_or_else(|e| e.into_inner());
-        *w = Active { policy, dummy };
+        *w = Active { policy, dummy, dummy_ms };
         Ok(())
+    }
+
+    /// How long every check is made to take at least: the policy's measured
+    /// time, or the stand-in's, whichever is longer. A saved hash made with
+    /// cheaper, older settings then can't reveal (by answering sooner) that
+    /// its user exists.
+    fn floor_ms(&self) -> u64 {
+        let a = self.read();
+        (a.policy.check_ms as u64).max(a.dummy_ms)
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Active> {
@@ -166,43 +184,82 @@ impl Hasher {
     /// Wait up to `wait` for a turn to hash or check a password. The policy
     /// allows one or two at once; the turn ends when the returned permit is
     /// dropped. `None` when the wait ran out (report the service as busy).
-    pub async fn turn(&self, wait: std::time::Duration) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    pub async fn turn(&self, wait: std::time::Duration) -> Option<OwnedSemaphorePermit> {
         let n = if self.policy().concurrency >= 2 { 1 } else { 2 };
-        tokio::time::timeout(wait, self.gate.acquire_many(n)).await.ok()?.ok()
+        tokio::time::timeout(wait, self.gate.clone().acquire_many_owned(n)).await.ok()?.ok()
+    }
+
+    /// Wait up to `wait` until no hashing runs, and keep it that way until
+    /// the returned permit is dropped (for timing the machine).
+    pub async fn all_turns(&self, wait: std::time::Duration) -> Option<OwnedSemaphorePermit> {
+        tokio::time::timeout(wait, self.gate.clone().acquire_many_owned(2)).await.ok()?.ok()
     }
 
     /// [`Hasher::hash`] on a blocking thread, after waiting up to `wait` for a
-    /// turn ([`Error::Busy`] when none came).
+    /// turn ([`Error::Busy`] when none came). The turn is held until the
+    /// hashing finishes, even if this future is dropped.
     pub async fn hash_async(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
         password: Zeroizing<String>,
         wait: std::time::Duration,
     ) -> Result<String, Error> {
-        let _turn = self.turn(wait).await.ok_or(Error::Busy)?;
+        let turn = self.turn(wait).await.ok_or(Error::Busy)?;
         let me = self.clone();
-        tokio::task::spawn_blocking(move || me.hash(&password)).await.map_err(|_| Error::Hashing)?
+        tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            me.hash(&password)
+        })
+        .await
+        .map_err(|_| Error::Hashing)?
     }
 
     /// [`Hasher::verify`] on a blocking thread, after waiting up to `wait` for
-    /// a turn ([`Verdict::Busy`] when none came).
+    /// a turn ([`Verdict::Busy`] when none came). The turn is held until the
+    /// check finishes, even if this future is dropped, and the answer never
+    /// comes sooner than a check with the current policy would take.
     pub async fn verify_async(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
         password: Zeroizing<String>,
         phc: Option<String>,
         wait: std::time::Duration,
     ) -> Verdict {
-        let Some(_turn) = self.turn(wait).await else {
+        self.verify_holding(password, phc, wait, None).await
+    }
+
+    /// [`Hasher::verify_async`], also holding `extra` (such as a place in
+    /// another queue) until the check finishes.
+    pub(crate) async fn verify_holding(
+        self: &Arc<Self>,
+        password: Zeroizing<String>,
+        phc: Option<String>,
+        wait: std::time::Duration,
+        extra: Option<OwnedSemaphorePermit>,
+    ) -> Verdict {
+        let Some(turn) = self.turn(wait).await else {
             return Verdict::Busy;
         };
+        let floor = Duration::from_millis(self.floor_ms());
+        let started = Instant::now();
         let me = self.clone();
-        tokio::task::spawn_blocking(move || me.verify(&password, phc.as_deref())).await.unwrap_or(Verdict::Wrong)
+        let verdict = tokio::task::spawn_blocking(move || {
+            let _held = (turn, extra);
+            me.verify(&password, phc.as_deref())
+        })
+        .await
+        .unwrap_or(Verdict::Wrong);
+        if let Some(rest) = floor.checked_sub(started.elapsed()) {
+            tokio::time::sleep(rest).await;
+        }
+        verdict
     }
 }
 
-fn make_dummy(policy: &HashPolicy) -> Result<String, Error> {
+fn make_dummy(policy: &HashPolicy) -> Result<(String, u64), Error> {
     let mut random = Zeroizing::new([0u8; 24]);
     getrandom::fill(random.as_mut()).map_err(|_| Error::Random)?;
-    hash_with(random.as_ref(), policy)
+    let started = Instant::now();
+    let dummy = hash_with(random.as_ref(), policy)?;
+    Ok((dummy, started.elapsed().as_millis().min(u64::MAX as u128) as u64))
 }
 
 fn hash_with(password: &[u8], policy: &HashPolicy) -> Result<String, Error> {
@@ -373,6 +430,40 @@ mod tests {
         assert_eq!(pw.policy(), quick());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_check_keeps_its_turn_until_the_hashing_ends() {
+        use std::time::Duration;
+        let h = Arc::new(Hasher::new(HashPolicy { m_kib: 64 * 1024, t: 3, ..HashPolicy::floor() }).unwrap());
+        let phc = h.hash("pw").unwrap();
+        // Start a check and give up on it almost at once, as a visitor who
+        // hangs up would.
+        let h2 = h.clone();
+        let check = tokio::spawn(async move {
+            h2.verify_async(Zeroizing::new("pw".into()), Some(phc), Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        check.abort();
+        let _ = check.await;
+        // The hashing still runs, so the one turn is still taken.
+        assert!(h.turn(Duration::from_millis(1)).await.is_none(), "the turn outlives the dropped caller");
+        assert!(h.turn(Duration::from_secs(10)).await.is_some(), "and is freed when the hashing ends");
+    }
+
+    #[tokio::test]
+    async fn answers_never_come_sooner_than_a_current_check() {
+        let h = Arc::new(Hasher::new(HashPolicy { check_ms: 300, concurrency: 2, ..HashPolicy::floor() }).unwrap());
+        let cheap =
+            Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, Params::new(8 * 1024, 1, 1, None).unwrap())
+                .hash_password(b"pw")
+                .unwrap()
+                .to_string();
+        let t = std::time::Instant::now();
+        assert!(
+            h.verify_async(Zeroizing::new("pw".into()), Some(cheap), std::time::Duration::from_secs(5)).await.is_good()
+        );
+        assert!(t.elapsed() >= std::time::Duration::from_millis(300), "{:?}", t.elapsed());
+    }
+
     #[test]
     fn debug_shows_no_hash() {
         let pw = Hasher::new(quick()).unwrap();
@@ -383,13 +474,13 @@ mod tests {
     #[tokio::test]
     async fn turns_limit_concurrency() {
         use std::time::Duration;
-        let one = std::sync::Arc::new(Hasher::new(HashPolicy::floor()).unwrap());
+        let one = Arc::new(Hasher::new(HashPolicy::floor()).unwrap());
         let first = one.turn(Duration::from_millis(10)).await.expect("free");
         assert!(one.turn(Duration::from_millis(10)).await.is_none(), "one at a time");
         drop(first);
         assert!(one.turn(Duration::from_millis(10)).await.is_some());
 
-        let two = std::sync::Arc::new(Hasher::new(quick()).unwrap());
+        let two = Arc::new(Hasher::new(quick()).unwrap());
         let a = two.turn(Duration::from_millis(10)).await.expect("free");
         let b = two.turn(Duration::from_millis(10)).await.expect("second");
         assert!(two.turn(Duration::from_millis(10)).await.is_none(), "two at a time");

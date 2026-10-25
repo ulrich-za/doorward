@@ -3,7 +3,7 @@
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
 use doorward::password::HashPolicy;
-use doorward::store::MemoryStore;
+use doorward::store::{MemoryStore, RememberedRecord, Store};
 use doorward::{Address, Doorward, IpNet, ManualClock, NewUser, RequestInfo, SetCookie, Visit};
 use http::{HeaderMap, HeaderValue, Method};
 use std::collections::BTreeMap;
@@ -39,6 +39,14 @@ pub async fn env_with(f: impl FnOnce(doorward::Builder) -> doorward::Builder) ->
 }
 
 impl Env {
+    /// The stored record behind this browser's remembered-browser cookie.
+    pub async fn remembered(&self, b: &Browser) -> Option<RememberedRecord> {
+        use sha2::Digest;
+        let token = b.jar.get("__Host-doorward-device")?;
+        let hash: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+        self.store.remembered(&hash).await.unwrap()
+    }
+
     pub async fn user(&self, name: &str, password: Option<&str>) -> doorward::User {
         self.dw
             .create_user(NewUser {

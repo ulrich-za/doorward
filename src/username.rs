@@ -7,7 +7,9 @@
 //! restrictive" profile does). Its *key* is the normalised name in lowercase,
 //! used to find the account at sign-in, so "Admin" and "admin" are one account.
 //! Its *skeleton* (Unicode UTS #39) maps look-alike characters to one form, so
-//! "paypal" and "pаypal" (with a Cyrillic "а") can't both be registered.
+//! "paypal" and "pаypal" (with a Cyrillic "а") can't both be registered. The
+//! skeleton is taken of the name as written and again after lowercasing, so
+//! look-alikes that depend on case ("PayPaI" with a capital I) collide too.
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_security::{RestrictionLevel, RestrictionLevelDetection};
@@ -48,7 +50,7 @@ impl Username {
             return Err(Error::UsernameInvalid);
         }
         let key = key_of(&display);
-        let skeleton = skeleton_of(&key);
+        let skeleton = skeleton_of(&display);
         Ok(Username { display, key, skeleton })
     }
 
@@ -74,15 +76,19 @@ impl std::fmt::Display for Username {
     }
 }
 
-/// The lookup key for what someone typed at sign-in, without the checks a
-/// new name gets (a name that fails them can't exist, so it simply won't be
-/// found). `None` for input too long to be a username.
+/// The lookup key for what someone typed at sign-in. `None` for input that
+/// can't be anyone's username (too long, or with characters no username
+/// has), which then isn't looked up at all; the rest of a new name's checks
+/// aren't needed, since a name that fails them simply won't be found.
 pub(crate) fn lookup_key(input: &str) -> Option<String> {
     if input.len() > MAX_INPUT_BYTES {
         return None;
     }
     let display: String = input.trim().nfkc().collect();
-    if display.is_empty() || display.chars().count() > MAX_USERNAME_CHARS {
+    if display.is_empty()
+        || display.chars().count() > MAX_USERNAME_CHARS
+        || !display.chars().all(|c| c.is_alphanumeric() || PUNCTUATION.contains(&c))
+    {
         return None;
     }
     Some(key_of(&display))
@@ -92,9 +98,14 @@ fn key_of(display: &str) -> String {
     display.to_lowercase().nfkc().collect()
 }
 
-fn skeleton_of(key: &str) -> String {
-    let s: String = unicode_security::skeleton(key).collect();
-    s.to_lowercase().nfkc().collect()
+/// The skeleton of the name as written, lowercased, then the skeleton of
+/// that again: the first catches look-alikes that need capitals (a capital
+/// "I" for an "l"), the second ones that appear only in lowercase.
+fn skeleton_of(display: &str) -> String {
+    let once: String = unicode_security::skeleton(display).collect();
+    let once = key_of(&once);
+    let twice: String = unicode_security::skeleton(&once).collect();
+    key_of(&twice)
 }
 
 /// Longest role name.
@@ -165,6 +176,19 @@ mod tests {
     }
 
     #[test]
+    fn look_alikes_that_depend_on_case_collide() {
+        // A capital I looks like a lowercase l.
+        let sk = |n: &str| Username::parse(n).unwrap().skeleton().to_string();
+        assert_eq!(sk("Ilse"), sk("llse"));
+        assert_eq!(sk("PayPaI"), sk("PayPal"));
+        assert_eq!(sk("PAYPAL"), sk("paypal"));
+        // Different case of one name is one key (and so one account) anyway.
+        assert_eq!(Username::parse("ILSE").unwrap().key(), Username::parse("ilse").unwrap().key());
+        // Greek capitals that look like Latin ones.
+        assert_eq!(sk("\u{391}\u{392}\u{395}"), sk("abe"));
+    }
+
+    #[test]
     fn bad_names_are_refused() {
         for n in [
             "",
@@ -186,6 +210,11 @@ mod tests {
         assert!(Username::parse(&"a".repeat(64)).is_ok());
         assert_eq!(lookup_key(&"x".repeat(5000)), None);
         assert_eq!(lookup_key(""), None);
+        // Characters no username has are never looked up (a NUL would make
+        // Postgres fail the query).
+        for n in ["tech1\u{0}", "a b", "a\tb", "x;y", "a\u{202e}b", "a\u{7f}"] {
+            assert_eq!(lookup_key(n), None, "{n:?}");
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 unicode-normalization = "0.1.24"
 unicode-security = "0.1.2"
 uuid = { version = "1.18", default-features = false, features = ["serde", "std"] }
-zeroize = { version = "1.8.2", features = ["serde"] }
+zeroize = { version = "1.9.1", features = ["serde"] }
 
 axum = { version = "0.8.4", default-features = false, features = ["json", "query", "tokio"], optional = true }
 webauthn-rs = { version = "0.5.5", default-features = false, features = ["conditional-ui"], optional = true }
@@ -64,6 +64,7 @@ http-body-util = "0.1.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 axum = { version = "0.8.4", features = ["macros"] }
 proptest = "1.7"
+sha2 = "0.10.9"
 
 [[example]]
 name = "minimal"

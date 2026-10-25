@@ -5,7 +5,7 @@ All notable changes to doorward are listed here. The format follows
 by the last number (0.1.1, 0.1.2, …) unless stated otherwise. Below 1.0, a
 release may change the API: read the notes before upgrading.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-25
 
 First release: headless sign-in for Rust web apps, starting with what
 pingrail 0.4 needs to move its sign-in into doorward, plus configurable
@@ -35,23 +35,37 @@ addresses and storage for SQLite and Postgres.
   re-authentication, listing and ending sessions.
 - Rate limits: per-visitor budgets (IPv4 address or IPv6 /64), slow-down
   then refusal after repeated failures, no account lockout, remembered
-  browsers (a device cookie) with their own budget and a reserved
-  password-check slot.
+  browsers (a device cookie, five per account) with their account's own
+  budget for attempts at that account, skipping the visitors' queue for
+  password checks. Refused visitors are never forgotten to make room. A
+  visitor who hangs up mid-check still has the guess counted, and the check
+  keeps its turn until it ends.
+- Answers to wrong passwords and unknown usernames are held back until a
+  check with the current hashing settings would have finished, so older,
+  cheaper hashes don't stand out.
 - Usernames: Unicode NFKC, case-insensitive keys, look-alikes refused (UTS
-  #39 skeletons), one script per name (Unicode's "highly restrictive").
+  #39 skeletons of the name as written and lowercased), one script per name
+  (Unicode's "highly restrictive").
 - Password rules: length limits, the 5,000 most common passwords refused,
   the username and app-chosen words refused, no composition rules; changing
   a password needs the current one.
 - Passkeys (`passkeys` feature, webauthn-rs 0.5): per-address relying
   parties, discoverable sign-in, confirmation, registration with resident
-  keys preferred, single-use two-minute requests capped per visitor and per
-  session, credential ids unique across accounts, counters checked, refusal
-  to remove the last way in.
+  keys preferred, single-use two-minute requests (starting one counts
+  against the visitor's budget; capped per visitor, per network, per account
+  and in all), credential ids unique across accounts, counters checked,
+  refusal to remove the last way in.
 - axum integration (`axum` feature): `Visitor`, `Authenticated` and `Recent`
   extractors, `require_signed_in` and `require_role` middleware, and JSON
-  endpoints (`routes()`).
+  endpoints (`routes()`), every response `Cache-Control: no-store`.
+- `Builder::trust_cf_connecting_ip`: `CF-Connecting-IP` is believed only when
+  the trusted proxies are Cloudflare's (off by default).
+- Changing, resetting or removing a password, and disabling an account,
+  forget the account's remembered browsers (a change keeps the current one,
+  with a new cookie).
 - `store::Store` trait with `MemoryStore`, and a conformance suite
-  (`test-util`) that every store must pass.
+  (`test-util`) that every store must pass, including that per-user queries
+  never touch another user's rows.
 - `doorward-sqlite` and `doorward-postgres` crates.
 - `testing::TestAuthenticator` (`test-util`): a software passkey device for
   tests without a browser.
@@ -61,6 +75,8 @@ addresses and storage for SQLite and Postgres.
 - Property tests over every parser that sees network input, cargo-fuzz
   targets (`fuzz/`), `deny.toml`, a threat model and an OWASP ASVS 5.0
   checklist.
+- An independent review before release; its findings are fixed and kept as
+  regression tests (listed in the threat model).
 
 ### Changed from pingrail 0.3's sign-in
 
@@ -70,9 +86,10 @@ addresses and storage for SQLite and Postgres.
   than 16 lanes, or more than 4 GiB-passes of work in total (pingrail checked
   memory only), and when they aren't Argon2 at all. Passwords over 1 KiB are
   refused before hashing.
-- The visitor's address behind a proxy comes from `CF-Connecting-IP` or the
-  right-most untrusted `X-Forwarded-For` entry (pingrail took the left-most,
-  which the visitor can write).
+- The visitor's address behind a proxy comes from the right-most untrusted
+  `X-Forwarded-For` entry (pingrail took the left-most, which the visitor can
+  write), or from `CF-Connecting-IP` when the app says its proxy is
+  Cloudflare's.
 - Rate limits are per visitor, not one budget shared by everyone.
 - Unknown usernames take the same store steps as known ones.
 - A request with two copies of the session cookie is treated as signed out.

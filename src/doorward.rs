@@ -25,10 +25,15 @@ const POLICY_KEY: &str = "doorward.hash_policy";
 const TOUCH_EVERY_MS: i64 = 60_000;
 const MAX_DISPLAY_NAME_CHARS: usize = 100;
 const MAX_USER_AGENT_CHARS: usize = 200;
+/// Remembered browsers kept per account; signing in on another one forgets
+/// the one used longest ago.
+const REMEMBERED_PER_USER: u32 = 5;
 
 /// The request facts doorward needs, taken from whatever web framework the
-/// app uses (the `axum` feature does this for axum).
-#[derive(Clone, Copy, Debug)]
+/// app uses (the `axum` feature does this for axum). Its `Debug` output
+/// leaves out the values of `Cookie`, `Authorization` and
+/// `Proxy-Authorization`.
+#[derive(Clone, Copy)]
 pub struct RequestInfo<'a> {
     /// The address of the connection's other end (a proxy, if there is one).
     pub peer: IpAddr,
@@ -39,6 +44,34 @@ pub struct RequestInfo<'a> {
     pub host: Option<&'a str>,
     /// The request headers.
     pub headers: &'a HeaderMap,
+}
+
+impl std::fmt::Debug for RequestInfo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Headers<'h>(&'h HeaderMap);
+        impl std::fmt::Debug for Headers<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let secret = |k: &http::HeaderName| {
+                    k == http::header::COOKIE
+                        || k == http::header::AUTHORIZATION
+                        || k == http::header::PROXY_AUTHORIZATION
+                };
+                f.debug_map()
+                    .entries(
+                        self.0
+                            .iter()
+                            .map(|(k, v)| (k, if secret(k) { "[hidden]" } else { v.to_str().unwrap_or("[binary]") })),
+                    )
+                    .finish()
+            }
+        }
+        f.debug_struct("RequestInfo")
+            .field("peer", &self.peer)
+            .field("method", self.method)
+            .field("host", &self.host)
+            .field("headers", &Headers(self.headers))
+            .finish()
+    }
 }
 
 /// One request, as doorward sees it: which of the app's addresses it was
@@ -120,6 +153,7 @@ pub struct Builder {
     store: Arc<dyn Store>,
     addresses: Vec<Address>,
     trusted_proxies: Vec<IpNet>,
+    cloudflare: bool,
     cookie_name: String,
     device_cookie_name: String,
     device_cookie: DeviceCookie,
@@ -147,6 +181,18 @@ impl Builder {
     /// this machine (`127.0.0.1`, `::1`). Needed for proxied addresses.
     pub fn trusted_proxies(mut self, nets: impl IntoIterator<Item = IpNet>) -> Builder {
         self.trusted_proxies.extend(nets);
+        self
+    }
+
+    /// Believe the `CF-Connecting-IP` header from the trusted proxies (default
+    /// off). Turn it on only when every trusted proxy is Cloudflare's own
+    /// (cloudflared, or Cloudflare's addresses in front of the app):
+    /// Cloudflare always overwrites the header, but other proxies (nginx,
+    /// Caddy, Traefik) pass it through as the visitor wrote it. Without it,
+    /// the visitor's address comes from `X-Forwarded-For`, which Cloudflare
+    /// sends too.
+    pub fn trust_cf_connecting_ip(mut self, yes: bool) -> Builder {
+        self.cloudflare = yes;
         self
     }
 
@@ -321,6 +367,7 @@ impl Builder {
             clock: self.clock,
             addresses: self.addresses,
             trusted: self.trusted_proxies,
+            cloudflare: self.cloudflare,
             cookie: self.cookie_name,
             device_cookie_name: self.device_cookie_name,
             device_cookie: self.device_cookie,
@@ -328,7 +375,7 @@ impl Builder {
             rules: self.rules,
             recent: self.recent,
             limiter: Limiter::new(self.limits),
-            visitor_gate: tokio::sync::Semaphore::new(1),
+            visitor_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             hash_wait: self.hash_wait,
             event_retention: self.event_retention,
             max_passkeys: self.max_passkeys_per_user,
@@ -345,6 +392,7 @@ pub(crate) struct Inner {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) addresses: Vec<Address>,
     trusted: Vec<IpNet>,
+    cloudflare: bool,
     cookie: String,
     device_cookie_name: String,
     device_cookie: DeviceCookie,
@@ -355,7 +403,7 @@ pub(crate) struct Inner {
     /// Visitors without a remembered browser check one password at a time,
     /// so of the one or two checks the machine allows, room is left for
     /// remembered browsers even during a flood of guesses.
-    visitor_gate: tokio::sync::Semaphore,
+    visitor_gate: Arc<tokio::sync::Semaphore>,
     hash_wait: Duration,
     event_retention: Duration,
     #[cfg_attr(not(feature = "passkeys"), allow(dead_code))]
@@ -395,6 +443,13 @@ pub(crate) fn clean_label(s: &str, default: &str) -> String {
     if s.is_empty() { default.to_string() } else { s }
 }
 
+/// What to log when a password check fails.
+struct OnFailure {
+    user: Option<Uuid>,
+    kind: &'static str,
+    detail: Option<&'static str>,
+}
+
 impl Doorward {
     /// Start setting up, with the store to keep everything in.
     pub fn builder(store: impl Store) -> Builder {
@@ -407,6 +462,7 @@ impl Doorward {
             store,
             addresses: Vec::new(),
             trusted_proxies: Vec::new(),
+            cloudflare: false,
             cookie_name: "__Host-doorward".into(),
             device_cookie_name: "__Host-doorward-device".into(),
             device_cookie: DeviceCookie::default(),
@@ -465,7 +521,7 @@ impl Doorward {
             None => net::single_header(req.headers, "host"),
         };
         let hp = host_raw.and_then(net::parse_host).ok_or(Error::AddressNotAllowed)?;
-        let through = net::through_proxy(req.peer, req.headers, &inner.trusted);
+        let through = net::through_proxy(req.peer, req.headers, &inner.trusted, inner.cloudflare);
         let idx = inner
             .addresses
             .iter()
@@ -482,7 +538,7 @@ impl Doorward {
             })
             .ok_or(Error::AddressNotAllowed)?;
         let address = &inner.addresses[idx];
-        let ip = net::client_ip(req.peer, req.headers, &inner.trusted);
+        let ip = net::client_ip(req.peer, req.headers, &inner.trusted, inner.cloudflare);
         let unsafe_method = !matches!(*req.method, Method::GET | Method::HEAD | Method::OPTIONS);
         let same_origin = same_origin(req.headers, address.origin());
         let user_agent = req
@@ -579,31 +635,65 @@ impl Doorward {
         Ok(rec.filter(|r| r.expires_ms > self.now()))
     }
 
-    /// Whose budget this attempt counts against: the remembered browser when
-    /// it belongs to `user` (or to anyone, when the user isn't known yet).
+    /// Whose budget this attempt counts against: the account's when the
+    /// browser is one of its remembered browsers and the attempt is at that
+    /// account (`user`; `None` when the account isn't known until the
+    /// attempt is checked, as for a passkey); otherwise the visitor's.
+    ///
+    /// A password attempt at a name that doesn't exist passes `Some(nil)`,
+    /// so it counts like an attempt at someone else's account: the budget
+    /// used can't tell an account holder which names exist.
     pub(crate) async fn who(&self, v: &Visit, user: Option<Uuid>) -> Result<(Who, Option<RememberedRecord>), Error> {
         let device = self.remembered(v).await?;
         let who = match &device {
-            Some(d) if user.is_none_or(|u| u == d.user_id) => Who::Remembered(d.token_hash),
+            Some(d) if user.is_none_or(|u| u == d.user_id) => Who::Remembered(d.user_id),
             _ => Who::Visitor(v.key),
         };
         Ok((who, device))
     }
 
     /// Check a password, after a turn at the visitor gate when the attempt
-    /// isn't from a remembered browser.
-    async fn check_password(&self, who: Who, password: &str, phc: Option<String>) -> Verdict {
-        if password.len() > MAX_PASSWORD_BYTES {
-            return Verdict::Wrong;
-        }
-        let _visitor_turn = match who {
-            Who::Visitor(_) => match tokio::time::timeout(self.0.hash_wait, self.0.visitor_gate.acquire()).await {
-                Ok(Ok(permit)) => Some(permit),
-                _ => return Verdict::Busy,
-            },
-            Who::Remembered(_) => None,
-        };
-        self.0.hasher.verify_async(Zeroizing::new(password.to_string()), phc, self.0.hash_wait).await
+    /// isn't from a remembered browser. A wrong password is counted against
+    /// `who` and logged as `on_failure` says.
+    ///
+    /// The check, and the counting, run in a task of their own: a visitor
+    /// who hangs up mid-check (so this future is dropped) still pays for the
+    /// guess, and the hashing turn and the visitor gate stay taken until
+    /// the hashing really ends.
+    async fn check_password(
+        &self,
+        v: &Visit,
+        who: Who,
+        password: &str,
+        phc: Option<String>,
+        on_failure: OnFailure,
+    ) -> Verdict {
+        let me = self.clone();
+        let v = v.clone();
+        let password = Zeroizing::new(password.to_string());
+        let task = tokio::spawn(async move {
+            let verdict = if password.len() > MAX_PASSWORD_BYTES {
+                Verdict::Wrong
+            } else {
+                let gate = match who {
+                    Who::Visitor(_) => {
+                        let gate = me.0.visitor_gate.clone().acquire_owned();
+                        match tokio::time::timeout(me.0.hash_wait, gate).await {
+                            Ok(Ok(permit)) => Some(permit),
+                            _ => return Verdict::Busy,
+                        }
+                    }
+                    Who::Remembered(_) => None,
+                };
+                me.0.hasher.verify_holding(password, phc, me.0.hash_wait, gate).await
+            };
+            if verdict == Verdict::Wrong {
+                me.0.limiter.failed(who, me.now());
+                me.event(on_failure.user, on_failure.kind, Some(&v), on_failure.detail).await;
+            }
+            verdict
+        });
+        task.await.unwrap_or(Verdict::Wrong)
     }
 
     pub(crate) async fn admit(&self, who: Who) -> Result<(), Error> {
@@ -636,13 +726,19 @@ impl Doorward {
             Some(k) => store.user_by_key(&k).await?,
             None => None,
         };
-        let (who, device) = self.who(v, user.as_ref().map(|u| u.id)).await?;
+        let user_id = user.as_ref().map_or(Uuid::nil(), |u| u.id);
+        let (who, device) = self.who(v, Some(user_id)).await?;
         self.admit(who).await?;
 
         // Look a hash up even for an unknown user, so both take the same steps.
-        let phc = store.password(user.as_ref().map_or(Uuid::nil(), |u| u.id)).await?;
+        let phc = store.password(user_id).await?;
         let phc = if user.is_some() { phc } else { None };
-        let verdict = self.check_password(who, password, phc.clone()).await;
+        let on_failure = OnFailure {
+            user: user.as_ref().map(|u| u.id),
+            kind: "sign_in_failed",
+            detail: Some(r#"{"method":"password"}"#),
+        };
+        let verdict = self.check_password(v, who, password, phc.clone(), on_failure).await;
         match (verdict, user, phc) {
             (Verdict::Busy, _, _) => Err(Error::Busy),
             (Verdict::Good { rehash }, Some(user), Some(phc)) => {
@@ -662,11 +758,8 @@ impl Doorward {
                 }
                 self.start_session(v, user, SignInMethod::Password, remember, device).await
             }
-            (_, user, _) => {
-                self.0.limiter.failed(who, self.now());
-                self.event(user.map(|u| u.id), "sign_in_failed", Some(v), Some(r#"{"method":"password"}"#)).await;
-                Err(Error::InvalidCredentials)
-            }
+            // Counted and logged by the check.
+            _ => Err(Error::InvalidCredentials),
         }
     }
 
@@ -712,16 +805,18 @@ impl Doorward {
             &token,
             lengths.persistent.then(|| lengths.max.as_secs().min(i64::MAX as u64) as i64),
         )];
-        cookies.push(self.remember_browser(&user, device, lengths.persistent).await?);
+        cookies.push(self.remember_browser(user.id, device, lengths.persistent).await?);
         let detail = format!(r#"{{"method":"{}"}}"#, method.as_str());
         self.event(Some(user.id), "sign_in", Some(v), Some(&detail)).await;
         Ok(SignedIn { session: Session::from_parts(&rec, user.into()), cookies })
     }
 
-    /// Issue or refresh the remembered-browser cookie for `user`.
+    /// Issue a fresh remembered-browser cookie for `user_id`, replacing the
+    /// browser's old one (`device`), and forget the account's remembered
+    /// browsers beyond the newest few.
     async fn remember_browser(
         &self,
-        user: &UserRecord,
+        user_id: Uuid,
         device: Option<RememberedRecord>,
         persistent_session: bool,
     ) -> Result<SetCookie, Error> {
@@ -740,12 +835,13 @@ impl Doorward {
             .store
             .insert_remembered(&RememberedRecord {
                 token_hash: h,
-                user_id: user.id,
+                user_id,
                 created_ms: now,
                 last_used_ms: now,
                 expires_ms: now.saturating_add(lifetime),
             })
             .await?;
+        inner.store.trim_remembered(user_id, REMEMBERED_PER_USER).await?;
         Ok(SetCookie::set(&inner.device_cookie_name, &t, max_age))
     }
 
@@ -796,15 +892,12 @@ impl Doorward {
         let (who, _) = self.who(v, Some(session.user.id)).await?;
         self.admit(who).await?;
         let phc = self.0.store.password(session.user.id).await?;
-        let verdict = self.check_password(who, password, phc).await;
-        match verdict {
+        let on_failure =
+            OnFailure { user: Some(session.user.id), kind: "confirm_failed", detail: Some(r#"{"method":"password"}"#) };
+        match self.check_password(v, who, password, phc, on_failure).await {
             Verdict::Busy => Err(Error::Busy),
             Verdict::Good { .. } => self.mark_recent(v, session, &rec, "password").await,
-            Verdict::Wrong => {
-                self.0.limiter.failed(who, self.now());
-                self.event(Some(session.user.id), "confirm_failed", Some(v), Some(r#"{"method":"password"}"#)).await;
-                Err(Error::InvalidCredentials)
-            }
+            Verdict::Wrong => Err(Error::InvalidCredentials),
         }
     }
 
@@ -862,8 +955,9 @@ impl Doorward {
 
     /// Change the signed-in user's own password. A user who has a password
     /// must give it (`current`); a user without one (passkeys only) needs a
-    /// recent sign-in instead. Every other session of theirs ends; this one
-    /// gets a new cookie (send the returned cookies).
+    /// recent sign-in instead. Every other session of theirs ends and their
+    /// other remembered browsers are forgotten; this one gets a new session
+    /// cookie and a new remembered-browser cookie (send the returned cookies).
     pub async fn change_password(
         &self,
         v: &Visit,
@@ -879,29 +973,25 @@ impl Doorward {
             Some(old) => {
                 let (who, _) = self.who(v, Some(session.user.id)).await?;
                 self.admit(who).await?;
-                match self.check_password(who, current.unwrap_or(""), Some(old)).await {
+                let on_failure =
+                    OnFailure { user: Some(session.user.id), kind: "password_change_failed", detail: None };
+                match self.check_password(v, who, current.unwrap_or(""), Some(old), on_failure).await {
                     Verdict::Good { .. } => {}
                     Verdict::Busy => return Err(Error::Busy),
-                    Verdict::Wrong => {
-                        self.0.limiter.failed(who, self.now());
-                        self.event(Some(session.user.id), "password_change_failed", Some(v), None).await;
-                        return Err(Error::InvalidCredentials);
-                    }
+                    Verdict::Wrong => return Err(Error::InvalidCredentials),
                 }
             }
             None => self.require_recent(&session)?,
         }
         let phc = self.hash_new(&session.user.username, new_password).await?;
-        store.set_password(session.user.id, &phc, self.now()).await?;
-        let ended = store.delete_sessions_for_user(session.user.id, Some(rec.id)).await?;
-        self.event(
-            Some(session.user.id),
-            "password_changed",
-            Some(v),
-            Some(&format!(r#"{{"sessions_ended":{ended}}}"#)),
-        )
-        .await;
-        self.mark_recent(v, session, &rec, "password").await
+        let user_id = session.user.id;
+        store.set_password(user_id, &phc, self.now()).await?;
+        let ended = store.delete_sessions_for_user(user_id, Some(rec.id)).await?;
+        store.delete_remembered_for_user(user_id).await?;
+        self.event(Some(user_id), "password_changed", Some(v), Some(&format!(r#"{{"sessions_ended":{ended}}}"#))).await;
+        let mut signed_in = self.mark_recent(v, session, &rec, "password").await?;
+        signed_in.cookies.push(self.remember_browser(user_id, None, rec.persistent).await?);
+        Ok(signed_in)
     }
 
     /// The signed-in user's sessions, newest first, marking this one.
@@ -1005,24 +1095,28 @@ impl Doorward {
     }
 
     /// Set a user's password (an admin reset, or `app passwd` on the
-    /// machine). Every session of theirs ends.
+    /// machine). Every session of theirs ends and their remembered browsers
+    /// are forgotten.
     pub async fn set_password(&self, id: Uuid, password: &str) -> Result<(), Error> {
         let store = &self.0.store;
         let user = store.user(id).await?.ok_or(Error::NotFound)?;
         let phc = self.hash_new(&user.username, password).await?;
         store.set_password(id, &phc, self.now()).await?;
         store.delete_sessions_for_user(id, None).await?;
+        store.delete_remembered_for_user(id).await?;
         self.event(Some(id), "password_set", None, None).await;
         Ok(())
     }
 
     /// Remove a user's password (they can then sign in only with passkeys).
-    /// Every session of theirs that began with the password ends.
+    /// Every session of theirs that began with the password ends, and their
+    /// remembered browsers are forgotten.
     pub async fn remove_password(&self, id: Uuid) -> Result<(), Error> {
         let store = &self.0.store;
         if !store.remove_password(id).await? {
             return Err(Error::NotFound);
         }
+        store.delete_remembered_for_user(id).await?;
         for s in store.sessions_for_user(id).await? {
             if s.method == SignInMethod::Password.as_str() {
                 store.delete_session(s.id).await?;
@@ -1044,7 +1138,8 @@ impl Doorward {
         Ok(())
     }
 
-    /// Enable or disable an account. Disabling ends its sessions at once.
+    /// Enable or disable an account. Disabling ends its sessions at once and
+    /// forgets its remembered browsers.
     pub async fn set_active(&self, id: Uuid, active: bool) -> Result<(), Error> {
         let store = &self.0.store;
         let mut u = store.user(id).await?.ok_or(Error::NotFound)?;
@@ -1052,6 +1147,7 @@ impl Doorward {
         store.update_user(&u).await?;
         if !active {
             store.delete_sessions_for_user(id, None).await?;
+            store.delete_remembered_for_user(id).await?;
         }
         self.event(Some(id), if active { "account_enabled" } else { "account_disabled" }, None, None).await;
         Ok(())
@@ -1099,9 +1195,11 @@ impl Doorward {
     /// Time password hashing again for this machine and switch to the new
     /// settings (saved in the store). Takes a second or two of full CPU.
     pub async fn retune_hashing(&self) -> Result<HashPolicy, Error> {
-        let _turn = self.0.hasher.turn(self.0.hash_wait).await.ok_or(Error::Busy)?;
+        // Timing needs the machine to itself: wait until no check runs.
+        let all = self.0.hasher.all_turns(self.0.hash_wait).await.ok_or(Error::Busy)?;
         let hasher = self.0.hasher.clone();
         let p = tokio::task::spawn_blocking(move || -> Result<HashPolicy, Error> {
+            let _all = all;
             let (p, _) = HashPolicy::load_or_tune(None, true)?;
             hasher.replace(p)?;
             Ok(p)
@@ -1246,13 +1344,24 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", http::HeaderValue::from_static("a.example"));
+        let v = dw
+            .visit(&RequestInfo {
+                peer: "192.0.2.1".parse().unwrap(),
+                method: &Method::POST,
+                host: None,
+                headers: &headers,
+            })
+            .unwrap();
+        let quiet = || OnFailure { user: None, kind: "test_failed", detail: None };
         // A flood of visitors holds the visitor gate.
         let _flood = dw.0.visitor_gate.acquire().await.unwrap();
         let visitor = Who::Visitor(VisitorKey::of("192.0.2.1".parse().unwrap()));
-        assert_eq!(dw.check_password(visitor, "pw", None).await, Verdict::Busy);
+        assert_eq!(dw.check_password(&v, visitor, "pw", None, quiet()).await, Verdict::Busy);
         // A remembered browser still gets its check.
         let phc = dw.0.hasher.hash("pw").unwrap();
-        assert!(dw.check_password(Who::Remembered([1; 32]), "pw", Some(phc)).await.is_good());
+        assert!(dw.check_password(&v, Who::Remembered(Uuid::nil()), "pw", Some(phc), quiet()).await.is_good());
     }
 
     #[test]

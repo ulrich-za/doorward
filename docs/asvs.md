@@ -34,7 +34,7 @@ responsibility; doorward gives it what it needs), **Partly**, or **Later**
 | 6.3.4 | 2 | No undocumented pathways; strength consistent | Met | Passwords and passkeys switched per address; `passkeys::passkeys_are_refused_where_turned_off` |
 | 6.3.5 | 3 | Users told of suspicious attempts | Partly | Failed and successful sign-ins are in the user's security log (`events`); notifications come with the notification hook |
 | 6.3.7 | 3 | Users told after credential changes | Partly | Logged (`password_changed`, `passkey_added`…); notifications with the hook |
-| 6.3.8 | 3 | Valid users can't be deduced | Met | Same error, same steps, stand-in hash; `sign_in::wrong_password_and_unknown_user_look_the_same` |
+| 6.3.8 | 3 | Valid users can't be deduced | Met | Same error, same steps, same budget, stand-in hash, answers padded to a current check; `sign_in::wrong_password_and_unknown_user_look_the_same`, `sign_in::unknown_names_take_as_long_after_the_hashing_is_retuned`, `sign_in::an_own_remembered_browser_reveals_no_usernames` |
 | 6.4.1 | 1 | Initial secrets random, short-lived | Later | One-time links (pingrail 0.5 step) |
 | 6.4.2 | 1 | No hints or secret questions | Met | None exist |
 | 6.4.3 | 2 | Secure forgotten-password process | Later | Recovery codes, slower recovery (before the public site) |
@@ -56,7 +56,7 @@ responsibility; doorward gives it what it needs), **Partly**, or **Later**
 | 7.3.2 | 2 | Absolute lifetime | Met | `SessionLengths::max`; same test |
 | 7.4.1 | 1 | Terminated sessions can't be used | Met | Deleted server-side; `sign_in::sign_in_sign_out` |
 | 7.4.2 | 1 | Disabling or deleting an account ends its sessions | Met | `sign_in::disabled_accounts` |
-| 7.4.3 | 2 | Option to end other sessions after a factor change | Met | They always end; `sign_in::changing_a_password_ends_other_sessions` |
+| 7.4.3 | 2 | Option to end other sessions after a factor change | Met | They always end, and other remembered browsers are forgotten; `sign_in::changing_a_password_ends_other_sessions` |
 | 7.4.4 | 2 | Visible sign-out | App | `POST /sign-out`; the app shows the button |
 | 7.4.5 | 2 | Admins can end a user's sessions | Met | `end_all_sessions` |
 | 7.5.1 | 2 | Re-authentication before changing sign-in details | Met | Passkeys and password changes need a recent sign-in or the current password |
@@ -75,8 +75,8 @@ responsibility; doorward gives it what it needs), **Partly**, or **Later**
 | 3.3.5 | 3 | Cookie under 4,096 bytes | Met | Names ≤ 64, values 43 characters |
 | 11.4.2 | 2 | Approved password hashing with current parameters | Met | Argon2id, OWASP floor, machine-sized |
 | 11.5.1 | 2 | CSPRNG with 128+ bits for unguessable values | Met | Tokens 256 bits, request ids 128 bits, user ids UUID v4 from the OS |
-| 14.3.2 | 2 | `Cache-Control: no-store` on sensitive responses | Met | Every endpoint; `http::sign_in_over_http` |
+| 14.3.2 | 2 | `Cache-Control: no-store` on sensitive responses | Met | Every response of the ready-made endpoints, errors included; `http::nothing_is_cacheable`. The app's own pages are the app's |
 | 16.2.1 | 2 | Log entries say when, where, who, what | Met | `EventRecord`: time (UTC ms), address, IP, user, kind |
-| 16.2.5 | 2 | Sensitive data not logged | Met | No passwords, tokens or cookies anywhere in logs |
-| 16.3.1 | 2 | All authentication logged, success and failure | Met | `sign_in`, `sign_in_failed`, `confirm_failed`…; `sign_in::wrong_password_and_unknown_user_look_the_same` |
+| 16.2.5 | 2 | Sensitive data not logged | Met | No passwords, tokens or cookies in logs or in doorward's `Debug` output; `sign_in::debug_output_hides_secrets` |
+| 16.3.1 | 2 | All authentication logged, success and failure | Met | `sign_in`, `sign_in_failed`, `confirm_failed`…, even when the visitor hangs up mid-check; `sign_in::wrong_password_and_unknown_user_look_the_same`, `disconnect` |
 | 16.3.3 | 2 | Attempts to bypass controls logged | Met | Cross-origin refusals, refused saved hashes, sessions on the wrong address |

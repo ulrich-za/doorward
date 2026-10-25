@@ -71,22 +71,27 @@ pub(crate) fn in_any(ip: IpAddr, nets: &[IpNet]) -> bool {
 }
 
 /// Did this request come through a trusted proxy? Only when the connection
-/// is from one of `trusted` *and* it says whom it forwards for.
-pub(crate) fn through_proxy(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> bool {
-    in_any(peer, trusted) && (headers.contains_key("cf-connecting-ip") || headers.contains_key("x-forwarded-for"))
+/// is from one of `trusted` *and* it says whom it forwards for
+/// (`X-Forwarded-For`, or `CF-Connecting-IP` when `cf` says the proxy is
+/// Cloudflare's).
+pub(crate) fn through_proxy(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet], cf: bool) -> bool {
+    in_any(peer, trusted)
+        && (headers.contains_key("x-forwarded-for") || (cf && headers.contains_key("cf-connecting-ip")))
 }
 
-/// The visitor's address. From a trusted proxy, `CF-Connecting-IP` (which
-/// Cloudflare always overwrites) is believed; otherwise the right-most
-/// `X-Forwarded-For` entry that isn't itself a trusted proxy, since
-/// everything left of it could have been written by the visitor. From anyone
-/// else, the connection's own address.
-pub(crate) fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+/// The visitor's address. From a trusted proxy: when `cf` (the proxy is
+/// Cloudflare's, which always overwrites it), `CF-Connecting-IP`; otherwise,
+/// or without one, the right-most `X-Forwarded-For` entry that isn't itself
+/// a trusted proxy, since everything left of it could have been written by
+/// the visitor. Other proxies pass `CF-Connecting-IP` through as the visitor
+/// sent it, so it is ignored unless `cf`. From anyone else, the connection's
+/// own address.
+pub(crate) fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet], cf: bool) -> IpAddr {
     let peer = canonical(peer);
     if !in_any(peer, trusted) {
         return peer;
     }
-    if let Some(ip) = single_header(headers, "cf-connecting-ip").and_then(|v| v.trim().parse::<IpAddr>().ok()) {
+    if cf && let Some(ip) = single_header(headers, "cf-connecting-ip").and_then(|v| v.trim().parse::<IpAddr>().ok()) {
         return canonical(ip);
     }
     let mut entries: Vec<&str> = Vec::new();
@@ -127,6 +132,16 @@ impl VisitorKey {
         match canonical(ip) {
             IpAddr::V4(a) => VisitorKey::V4(u32::from(a)),
             IpAddr::V6(a) => VisitorKey::V6((u128::from(a) >> 64) as u64),
+        }
+    }
+
+    /// The wider network the visitor is in: the IPv4 /24, or the IPv6 /48
+    /// (often one site's whole allocation).
+    #[cfg_attr(not(feature = "passkeys"), allow(dead_code))]
+    pub(crate) fn network(self) -> VisitorKey {
+        match self {
+            VisitorKey::V4(a) => VisitorKey::V4(a & 0xffff_ff00),
+            VisitorKey::V6(p) => VisitorKey::V6(p & !0xffff),
         }
     }
 }
@@ -241,11 +256,27 @@ mod tests {
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
         let fwd = h(&[("cf-connecting-ip", "198.51.100.7")]);
-        assert_eq!(client_ip(local, &fwd, &trusted), "198.51.100.7".parse::<IpAddr>().unwrap());
-        assert_eq!(client_ip(stranger, &fwd, &trusted), stranger, "stranger's headers ignored");
-        assert!(through_proxy(local, &fwd, &trusted));
-        assert!(!through_proxy(stranger, &fwd, &trusted));
-        assert!(!through_proxy(local, &HeaderMap::new(), &trusted), "a direct local browser");
+        assert_eq!(client_ip(local, &fwd, &trusted, true), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(stranger, &fwd, &trusted, true), stranger, "stranger's headers ignored");
+        assert!(through_proxy(local, &fwd, &trusted, true));
+        assert!(!through_proxy(stranger, &fwd, &trusted, true));
+        assert!(!through_proxy(local, &HeaderMap::new(), &trusted, true), "a direct local browser");
+    }
+
+    #[test]
+    fn cf_connecting_ip_is_believed_only_from_cloudflare() {
+        // nginx, Caddy and Traefik pass CF-Connecting-IP through as the
+        // visitor wrote it, and append the real address to X-Forwarded-For.
+        let trusted = nets(&["127.0.0.1"]);
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let m = h(&[("x-forwarded-for", "198.51.100.7"), ("cf-connecting-ip", "10.9.8.7")]);
+        assert_eq!(client_ip(local, &m, &trusted, false), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(local, &m, &trusted, true), "10.9.8.7".parse::<IpAddr>().unwrap());
+        // Without X-Forwarded-For, a CF-Connecting-IP alone doesn't make it a
+        // forwarded request unless the proxy is Cloudflare's.
+        let only_cf = h(&[("cf-connecting-ip", "10.9.8.7")]);
+        assert!(!through_proxy(local, &only_cf, &trusted, false));
+        assert_eq!(client_ip(local, &only_cf, &trusted, false), local);
     }
 
     #[test]
@@ -254,19 +285,19 @@ mod tests {
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         // The visitor wrote "1.1.1.1"; the proxy appended the real address.
         let spoof = h(&[("x-forwarded-for", "1.1.1.1, 198.51.100.7")]);
-        assert_eq!(client_ip(local, &spoof, &trusted), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(local, &spoof, &trusted, true), "198.51.100.7".parse::<IpAddr>().unwrap());
         // Trusted hops on the right are skipped.
         let hops = h(&[("x-forwarded-for", "198.51.100.7, 10.1.2.3")]);
-        assert_eq!(client_ip(local, &hops, &trusted), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(local, &hops, &trusted, true), "198.51.100.7".parse::<IpAddr>().unwrap());
         // Split across two headers.
         let two = h(&[("x-forwarded-for", "1.1.1.1"), ("x-forwarded-for", "198.51.100.8")]);
-        assert_eq!(client_ip(local, &two, &trusted), "198.51.100.8".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(local, &two, &trusted, true), "198.51.100.8".parse::<IpAddr>().unwrap());
         // Garbage: fall back to the connection.
         let junk = h(&[("x-forwarded-for", "not-an-ip")]);
-        assert_eq!(client_ip(local, &junk, &trusted), local);
+        assert_eq!(client_ip(local, &junk, &trusted, true), local);
         // A doubled CF-Connecting-IP isn't believed.
         let double = h(&[("cf-connecting-ip", "1.1.1.1"), ("cf-connecting-ip", "2.2.2.2")]);
-        assert_eq!(client_ip(local, &double, &trusted), local);
+        assert_eq!(client_ip(local, &double, &trusted, true), local);
     }
 
     #[test]
@@ -277,6 +308,12 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(VisitorKey::of("::ffff:1.2.3.4".parse().unwrap()), VisitorKey::of("1.2.3.4".parse().unwrap()));
+        // Networks: IPv6 /48, IPv4 /24.
+        assert_eq!(a.network(), c.network());
+        assert_ne!(a.network(), VisitorKey::of("2001:db8:2::1".parse().unwrap()).network());
+        let v4 = |s: &str| VisitorKey::of(s.parse().unwrap()).network();
+        assert_eq!(v4("198.51.100.1"), v4("198.51.100.254"));
+        assert_ne!(v4("198.51.100.1"), v4("198.51.101.1"));
     }
 
     #[test]

@@ -647,6 +647,19 @@ impl Store for SqliteStore {
         .await
     }
 
+    async fn trim_remembered(&self, user_id: Uuid, keep: u32) -> Result<u64, StoreError> {
+        self.run(move |c| {
+            Ok(c.execute(
+                "DELETE FROM auth_remembered WHERE user_id = ?1 AND token_hash NOT IN (
+                     SELECT token_hash FROM auth_remembered WHERE user_id = ?1
+                     ORDER BY created_ms DESC, token_hash DESC LIMIT ?2)",
+                rusqlite::params![user_id.to_string(), i64::from(keep)],
+            )
+            .map_err(map_err)? as u64)
+        })
+        .await
+    }
+
     async fn prune_remembered(&self, now_ms: i64) -> Result<u64, StoreError> {
         self.run(move |c| {
             Ok(c.execute("DELETE FROM auth_remembered WHERE expires_ms <= ?1", [now_ms]).map_err(map_err)? as u64)

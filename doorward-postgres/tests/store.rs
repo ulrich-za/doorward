@@ -106,6 +106,10 @@ async fn doorward_runs_on_postgres() {
         .unwrap();
     let signed = dw.sign_in_password(&v, "Tech1", "a long passphrase", false).await.unwrap();
     assert!(signed.session.user.has_role("tech"));
+    // Postgres refuses a NUL in text; such a name is never sent to it, and the
+    // answer is the ordinary one, not an internal error.
+    let err = dw.sign_in_password(&v, "tech1\u{0}", "a long passphrase", false).await.unwrap_err();
+    assert_eq!(err.code(), doorward::ErrorCode::InvalidCredentials);
     // The app can reference doorward's users from its own tables.
     sqlx::query("CREATE TABLE jobs (id SERIAL PRIMARY KEY, tech UUID NOT NULL REFERENCES auth_users(id))")
         .execute(&s.pool)

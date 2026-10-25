@@ -223,7 +223,8 @@ impl Default for PasswordRules {
 }
 
 /// A new account for [`Doorward::create_user`](crate::Doorward::create_user).
-#[derive(Clone, Debug, Default)]
+/// Its `Debug` output leaves the password out.
+#[derive(Clone, Default)]
 pub struct NewUser {
     /// The username (checked by [`Username::parse`](crate::Username::parse)).
     pub username: String,
@@ -233,4 +234,15 @@ pub struct NewUser {
     pub roles: Vec<String>,
     /// A first password, if the account should have one.
     pub password: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for NewUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUser")
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .field("roles", &self.roles)
+            .field("has_password", &self.password.is_some())
+            .finish()
+    }
 }

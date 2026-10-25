@@ -6,6 +6,7 @@
 mod common;
 
 use common::*;
+use doorward::password::HashPolicy;
 use doorward::store::Store;
 use doorward::{Error, ErrorCode, Limits, NewUser, PasswordRules, SessionLengths};
 use http::Method;
@@ -360,18 +361,25 @@ async fn changing_a_password_ends_other_sessions() {
     assert_eq!(list.len(), 2);
     assert_eq!(list.iter().filter(|x| x.current).count(), 1);
 
+    assert!(e.remembered(&phone).await.is_some() && e.remembered(&laptop).await.is_some());
+    let before = phone.jar["__Host-doorward-device"].clone();
     let s =
         e.dw.change_password(&phone.post(&e.dw), Some("correct horse battery"), "a brand new password").await.unwrap();
     phone.take(&s.cookies);
     assert!(e.dw.authenticate(&phone.get(&e.dw)).await.unwrap().is_some(), "this one stays");
     assert!(e.dw.authenticate(&laptop.get(&e.dw)).await.unwrap().is_none(), "the other ended");
+    // Other remembered browsers are forgotten; this one gets a new cookie.
+    assert_ne!(phone.jar["__Host-doorward-device"], before);
+    assert!(e.remembered(&phone).await.is_some(), "this browser is still remembered");
+    assert!(e.remembered(&laptop).await.is_none(), "the other browser is forgotten");
     assert!(e.dw.sign_in_password(&laptop.post(&e.dw), "admin", "correct horse battery", false).await.is_err());
     // Rules for new passwords.
     let short = e.dw.change_password(&phone.post(&e.dw), Some("a brand new password"), "short").await.unwrap_err();
     assert_eq!(short.code(), ErrorCode::PasswordTooShort);
-    // An admin reset ends every session.
+    // An admin reset ends every session and forgets every remembered browser.
     e.dw.set_password(u.id, "reset by the boss").await.unwrap();
     assert!(e.dw.authenticate(&phone.get(&e.dw)).await.unwrap().is_none());
+    assert!(e.remembered(&phone).await.is_none());
     let events: Vec<String> = e.store.events_for_user(u.id, 50).await.unwrap().into_iter().map(|x| x.kind).collect();
     assert!(
         events.contains(&"password_changed".to_string()) && events.contains(&"password_set".to_string()),
@@ -541,4 +549,245 @@ async fn the_hash_policy_is_tuned_once_and_saved() {
     assert_eq!(doorward::password::HashPolicy::from_json(&saved), Some(dw.hasher().policy()));
     let again = Doorward::builder_shared(store.clone()).address(Address::new(LAN).unwrap()).build().await.unwrap();
     assert_eq!(again.hasher().policy(), dw.hasher().policy(), "reused, not retuned");
+}
+
+// ----- found in the review before 0.1.0, kept as regression tests ------------------
+
+#[tokio::test]
+async fn an_own_remembered_browser_reveals_no_usernames() {
+    // Mallory has an account, so a remembered browser of her own. Attempts
+    // at names that don't exist must count like attempts at someone else's
+    // account, or the budget that runs out would tell her which names exist.
+    let e = env_with(|b| b.limits(Limits { slow_step: Duration::ZERO, ..Limits::default() })).await;
+    e.user("victim", Some("blue tractor umbrella")).await;
+    e.user("mallory", Some("green ladder piano")).await;
+    let mut m = Browser::lan();
+    let s = e.dw.sign_in_password(&m.post(&e.dw), "mallory", "green ladder piano", false).await.unwrap();
+    m.take(&s.cookies);
+    m.jar.remove("__Host-doorward");
+    for _ in 0..20 {
+        let _ = e.dw.sign_in_password(&m.post(&e.dw), "victim", "guess", false).await;
+    }
+    let known = e.dw.sign_in_password(&m.post(&e.dw), "victim", "x", false).await.unwrap_err();
+    let unknown = e.dw.sign_in_password(&m.post(&e.dw), "nosuchuser", "x", false).await.unwrap_err();
+    assert_eq!(known.code(), ErrorCode::TooManyAttempts);
+    assert_eq!(unknown.code(), ErrorCode::TooManyAttempts, "the same answer for a name that doesn't exist");
+    // Her own account still has its remembered budget, however she types it.
+    assert!(e.dw.sign_in_password(&m.post(&e.dw), "MALLORY", "green ladder piano", false).await.is_ok());
+}
+
+#[tokio::test]
+async fn new_remembered_cookies_give_no_extra_guesses() {
+    // Every sign-in issues a fresh device cookie. Collecting them must not
+    // buy more guesses than the visitor's own budget.
+    let e = env_with(|b| b.limits(Limits { slow_step: Duration::ZERO, ..Limits::default() })).await;
+    e.user("mallory", Some("green ladder piano")).await;
+    // Eight sign-ins, each from a browser without a cookie yet.
+    let mut minted = Vec::new();
+    for _ in 0..8 {
+        let mut m = Browser::lan();
+        let s = e.dw.sign_in_password(&m.post(&e.dw), "mallory", "green ladder piano", false).await.unwrap();
+        m.take(&s.cookies);
+        m.jar.remove("__Host-doorward");
+        minted.push(m);
+        e.clock.advance(Duration::from_millis(10));
+    }
+    let mut guesses = 0;
+    for m in &minted {
+        loop {
+            match e.dw.sign_in_password(&m.post(&e.dw), "nosuchuser", "x", false).await {
+                Err(Error::InvalidCredentials) => guesses += 1,
+                Err(Error::TooManyAttempts { .. }) => break,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(guesses, 12, "the visitor's 20 attempts, less her 8 sign-ins");
+    // An account keeps its five newest remembered browsers.
+    let mut kept = Vec::new();
+    for b in &minted {
+        kept.push(e.remembered(b).await.is_some());
+    }
+    assert_eq!(kept, [false, false, false, true, true, true, true, true]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_holder_cant_starve_remembered_browsers() {
+    // Mallory floods guesses while holding many device cookies of her own.
+    // Only attempts at her own account may skip the visitor queue, so one of
+    // the two password checks stays free for the owner's remembered browser.
+    let policy = HashPolicy { t: 10, concurrency: 2, ..HashPolicy::floor() };
+    let limits =
+        Limits { visitor_burst: 100_000, slow_step: Duration::ZERO, refuse_after: 100_000, ..Limits::default() };
+    let e = env_with(|b| b.hash_wait(Duration::from_secs(2)).hash_policy(policy).limits(limits)).await;
+    e.user("owner", Some("blue tractor umbrella")).await;
+    e.user("mallory", Some("green ladder piano")).await;
+    let mut owner = Browser::lan();
+    owner.ip = "192.0.2.10".parse().unwrap();
+    let s = e.dw.sign_in_password(&owner.post(&e.dw), "owner", "blue tractor umbrella", false).await.unwrap();
+    owner.take(&s.cookies);
+    owner.jar.remove("__Host-doorward");
+
+    let mut visits = Vec::new();
+    for i in 0..12u32 {
+        let mut b = Browser::lan();
+        b.ip = format!("198.51.100.{}", 1 + i).parse().unwrap();
+        let s = e.dw.sign_in_password(&b.post(&e.dw), "mallory", "green ladder piano", false).await.unwrap();
+        b.take(&s.cookies);
+        b.jar.remove("__Host-doorward");
+        visits.push(b.post(&e.dw));
+    }
+    let mut flood = Vec::new();
+    for v in visits {
+        let dw = e.dw.clone();
+        flood.push(tokio::spawn(async move {
+            loop {
+                let _ = dw.sign_in_password(&v, "nosuchuser", "x", false).await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..5 {
+        let r = e.dw.sign_in_password(&owner.post(&e.dw), "owner", "blue tractor umbrella", false).await;
+        let s = r.expect("the owner is never told the service is busy");
+        owner.take(&s.cookies);
+        owner.jar.remove("__Host-doorward");
+    }
+    for t in flood {
+        t.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_failing_flood_cant_wash_out_a_refused_visitor() {
+    let e = env_with(|b| b.limits(Limits { tracked_max: 100, slow_step: Duration::ZERO, ..Limits::default() })).await;
+    e.user("admin", Some("blue tractor umbrella")).await;
+    let bad = Browser::public("2001:db8:ffff::1");
+    let mut refused = false;
+    for _ in 0..40 {
+        if let Err(Error::TooManyAttempts { .. }) =
+            e.dw.sign_in_password(&bad.post(&e.dw), "admin", "guess", false).await
+        {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+    // 150 other /64s, one failed guess each: more than the table holds.
+    for i in 0..150u32 {
+        let b = Browser::public(&format!("2001:db8:{i:x}::1"));
+        let _ = e.dw.sign_in_password(&b.post(&e.dw), "admin", "guess", false).await;
+    }
+    let r = e.dw.sign_in_password(&bad.post(&e.dw), "admin", "guess", false).await;
+    assert_eq!(r.unwrap_err().code(), ErrorCode::TooManyAttempts, "still refused");
+}
+
+#[tokio::test]
+async fn cf_connecting_ip_is_believed_only_when_the_proxy_is_cloudflare() {
+    // nginx, Caddy and Traefik pass CF-Connecting-IP through as the visitor
+    // wrote it; only Cloudflare overwrites it.
+    for (cloudflare, expect) in [(false, "198.51.100.7"), (true, "10.9.8.7")] {
+        let e = env_with(|b| b.trust_cf_connecting_ip(cloudflare)).await;
+        let mut h = http::HeaderMap::new();
+        h.insert("host", "pingrail-admin.example.com".parse().unwrap());
+        h.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        h.insert("cf-connecting-ip", "10.9.8.7".parse().unwrap());
+        let v =
+            e.dw.visit(&doorward::RequestInfo {
+                peer: "127.0.0.1".parse().unwrap(),
+                method: &Method::POST,
+                host: None,
+                headers: &h,
+            })
+            .unwrap();
+        assert_eq!(v.ip().to_string(), expect, "cloudflare: {cloudflare}");
+    }
+}
+
+#[tokio::test]
+async fn look_alikes_that_depend_on_case_are_refused() {
+    let e = env().await;
+    e.user("Ilse", None).await;
+    e.user("PayPal", None).await;
+    for name in ["llse", "PayPaI", "PAYPAL"] {
+        let r = e.dw.create_user(NewUser { username: name.into(), ..Default::default() }).await;
+        assert_eq!(r.unwrap_err().code(), ErrorCode::UsernameTaken, "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_names_take_as_long_after_the_hashing_is_retuned() {
+    // A real user's hash keeps its old, cheaper settings until they next sign
+    // in; the stand-in for unknown names uses the new ones. Answers are
+    // padded to the slower of the two, so neither is quicker.
+    let limits = Limits { visitor_burst: 1000, slow_step: Duration::ZERO, refuse_after: 1000, ..Limits::default() };
+    let e = env_with(|b| b.limits(limits)).await;
+    e.user("admin", Some("correct horse battery")).await;
+    e.dw.hasher().replace(HashPolicy { m_kib: 96 * 1024, t: 3, concurrency: 2, ..HashPolicy::floor() }).unwrap();
+    let b = Browser::lan();
+    let time = |name: &'static str| {
+        let (dw, v) = (e.dw.clone(), b.post(&e.dw));
+        async move {
+            let t = std::time::Instant::now();
+            let _ = dw.sign_in_password(&v, name, "wrong", false).await;
+            t.elapsed()
+        }
+    };
+    let (mut known, mut unknown) = (Duration::ZERO, Duration::ZERO);
+    for _ in 0..4 {
+        known += time("admin").await;
+        unknown += time("nobody").await;
+    }
+    assert!(unknown < known * 2 && known < unknown * 2, "known {known:?} unknown {unknown:?}");
+}
+
+#[tokio::test]
+async fn debug_output_hides_secrets() {
+    let e = env().await;
+    e.user("admin", Some("correct horse battery")).await;
+    let mut b = Browser::lan();
+    let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+    assert!(!format!("{s:?}").contains(s.cookies[0].as_str().split(';').next().unwrap().split('=').nth(1).unwrap()));
+    b.take(&s.cookies);
+    let token = b.jar["__Host-doorward"].clone();
+    let mut headers = b.headers(&Method::GET);
+    headers.insert("authorization", "Bearer sekrit-bearer".parse().unwrap());
+    let ri = doorward::RequestInfo { peer: b.peer(), method: &Method::GET, host: None, headers: &headers };
+    let shown = format!("{ri:?}");
+    assert!(!shown.contains(&token) && !shown.contains("sekrit-bearer"), "{shown}");
+    assert!(shown.contains("pc.lan"), "the rest is shown: {shown}");
+    assert!(!format!("{:?}", b.get(&e.dw)).contains(&token));
+    let nu =
+        NewUser { username: "a".into(), password: Some("hunter2-plaintext".to_string().into()), ..Default::default() };
+    assert!(!format!("{nu:?}").contains("hunter2-plaintext"));
+}
+
+#[tokio::test]
+async fn names_no_account_can_have_are_simply_wrong() {
+    // A NUL (which Postgres refuses in text) or other characters no username
+    // has are never looked up, and the answer is the usual one.
+    let e = env().await;
+    e.user("tech1", Some("blue tractor umbrella")).await;
+    for name in ["tech1\u{0}", "tech1\u{202e}", "tech 1"] {
+        let r = e.dw.sign_in_password(&Browser::lan().post(&e.dw), name, "blue tractor umbrella", false).await;
+        assert_eq!(r.unwrap_err().code(), ErrorCode::InvalidCredentials, "{name:?}");
+    }
+}
+
+#[tokio::test]
+async fn disabling_an_account_forgets_its_remembered_browsers() {
+    let e = env().await;
+    let u = e.user("admin", Some("correct horse battery")).await;
+    let mut b = Browser::lan();
+    let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+    b.take(&s.cookies);
+    assert!(e.remembered(&b).await.is_some());
+    e.dw.set_active(u.id, false).await.unwrap();
+    assert!(e.remembered(&b).await.is_none());
+    e.dw.set_active(u.id, true).await.unwrap();
+    let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+    b.take(&s.cookies);
+    e.dw.remove_password(u.id).await.unwrap();
+    assert!(e.remembered(&b).await.is_none(), "and so does removing the password");
 }

@@ -37,6 +37,7 @@ let dw = Doorward::builder(store)
             .remembered(None),
     )
     .trusted_proxies([IpNet::parse("127.0.0.1")?, IpNet::parse("::1")?])
+    .trust_cf_connecting_ip(true)   // only cloudflared forwards to this app
     .app_name("pingrail")
     .refuse_password_words(["pingrail"])
     .build()
@@ -56,9 +57,16 @@ it has a passkey. doorward refuses to remove the last passkey at an address
 without passwords.
 
 **Proxied addresses** match only requests from a trusted proxy that say whom
-they forward for (`CF-Connecting-IP` or `X-Forwarded-For`) and were
-forwarded over HTTPS (`X-Forwarded-Proto: https`). cloudflared sends all of
-these. A direct address never matches a forwarded request.
+they forward for (`X-Forwarded-For`) and were forwarded over HTTPS
+(`X-Forwarded-Proto: https`). cloudflared sends all of these. A direct
+address never matches a forwarded request.
+
+**`CF-Connecting-IP`** is ignored unless `trust_cf_connecting_ip(true)`. Turn
+it on only when every trusted proxy is Cloudflare's (cloudflared, or
+Cloudflare's own addresses in front of the app): Cloudflare overwrites the
+header, but nginx, Caddy and Traefik pass it through as the visitor wrote
+it, which would let visitors choose their own rate-limit budget. Without it,
+the address comes from `X-Forwarded-For`, which Cloudflare also sends.
 
 ## 3. Serve with the peer address
 
@@ -106,13 +114,20 @@ Error responses are `{"error": "<code>"}` (plus `retry_after` and a
 `Retry-After` header when rate-limited). The codes are listed in
 `doorward::ErrorCode`.
 
+Each passkey sign-in the page starts (including one for autofill, on every
+visit to the sign-in page) counts against the visitor's budget and stays
+open for two minutes unless finished. A visitor (one address, or an IPv6
+/64) may have 8 open at once, so start them only when needed: once for
+autofill when the page loads, or when the button is clicked, never on a
+timer.
+
 ## 6. Recovery on the machine
 
 Physical access to the server is the root of trust. Give the app a command
 line such as:
 
 ```rust
-dw.set_password(user.id, &new_password).await?;   // ends every session of theirs
+dw.set_password(user.id, &new_password).await?;   // ends every session, forgets remembered browsers
 dw.remove_all_passkeys(user.id).await?;            // `passkeys reset`
 dw.end_all_sessions(user.id).await?;
 ```
@@ -149,4 +164,6 @@ example with `store.meta_set("pingrail.migrated", "1")`).
   in the app is the one thing doorward can't defend against.
 - Run several copies only with sticky sessions until shared rate-limit and
   passkey storage arrive.
+- If anyone can sign up, limit sign-ups: each account brings its own small
+  budgets (see "Many accounts, many budgets" in the threat model).
 - Have an independent review done before going live with many users.

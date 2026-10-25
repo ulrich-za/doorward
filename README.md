@@ -21,13 +21,17 @@ doors of Théoden's hall.
 - **Sessions** stored only as hashes, bound to the address they were made
   on, with idle and absolute limits, `__Host-` cookies, a new cookie at every
   sign-in and confirmation, and a list the user can end sessions from.
+- **Usernames** compared case-insensitively, with look-alikes refused (UTS #39
+  skeletons, case included), and nothing in sign-in that tells anyone which
+  names exist.
 - **Recent sign-in** before sensitive actions, confirmed with the password
   or a passkey.
 - **Rate limits nobody can use to lock you out:** each visitor (an IPv4
   address or IPv6 /64) has its own budget, accounts are never locked, and a
-  browser that signed in before has its own budget and a reserved
-  password-check slot, so a flood from elsewhere — even from your own
-  address — can't stop you.
+  browser that signed in before has its account's own budget and skips the
+  visitors' queue for password checks, so a flood from elsewhere — even from
+  your own address — can't stop you. A guess is counted even if the visitor
+  hangs up mid-check.
 - **A security log** of sign-ins, failures and changes, per user and on its
   own `tracing` target.
 - **axum integration:** extractors (`Authenticated`, `Recent`), role
