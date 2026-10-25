@@ -102,7 +102,8 @@ async fn users<S: Store + ?Sized>(s: &S) {
 
     // Unique key and skeleton, whatever the id.
     let mut dup = user(&name);
-    assert_eq!(s.insert_user(&dup).await, Err(StoreError::Conflict("username")));
+    // Both the key and the skeleton collide: either may be reported.
+    assert!(matches!(s.insert_user(&dup).await, Err(StoreError::Conflict("username" | "skeleton"))));
     dup.username_key = format!("other{}", rand_suffix());
     assert_eq!(s.insert_user(&dup).await, Err(StoreError::Conflict("skeleton")));
     let mut same_id = user(&format!("Bob{}", rand_suffix()));

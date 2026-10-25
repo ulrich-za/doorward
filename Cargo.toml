@@ -13,7 +13,7 @@ categories = ["authentication", "cryptography", "web-programming"]
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE", "docs/*.md"]
 
 [workspace]
-members = ["."]
+members = [".", "doorward-sqlite"]
 # doorward-postgres uses sqlx, which Cargo won't resolve alongside rusqlite in
 # one dependency graph (both link SQLite), so it is a workspace of its own.
 exclude = ["doorward-postgres", "fuzz"]

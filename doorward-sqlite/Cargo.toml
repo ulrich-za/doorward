@@ -1,0 +1,34 @@
+[package]
+name = "doorward-sqlite"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "SQLite storage for doorward (sign-in for Rust web apps)"
+authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/ulrich-za/doorward"
+readme = "README.md"
+keywords = ["authentication", "sqlite", "doorward", "passkeys"]
+categories = ["authentication", "database"]
+
+[features]
+default = ["bundled"]
+# Build SQLite into the program (nothing to install).
+bundled = ["rusqlite/bundled"]
+
+[dependencies]
+doorward = { version = "0.2.0", path = "..", default-features = false }
+async-trait = "0.1.89"
+# A range, so an app on any of these rusqlite versions shares one SQLite.
+rusqlite = { version = ">=0.40.2, <0.42" }
+tokio = { version = "1.48", default-features = false, features = ["rt"] }
+uuid = { version = "1.18", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+doorward = { version = "0.2.0", path = "..", features = ["test-util"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+rusqlite = { version = ">=0.40.2, <0.42" }
+http = "1.3"
+
+[lints.rust]
+unsafe_code = "forbid"
