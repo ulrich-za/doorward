@@ -194,6 +194,18 @@ pub trait Store: Send + Sync + 'static {
     async fn insert_session(&self, session: &SessionRecord) -> Result<(), StoreError>;
     /// A session by the hash of its cookie.
     async fn session_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError>;
+    /// A session by the hash of its cookie, with its user (`None` when the
+    /// user is gone). This is the lookup behind every signed-in request:
+    /// stores that can do it in one step (one query, one trip to a blocking
+    /// thread) should override this default, which makes two calls.
+    async fn session_with_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<(SessionRecord, Option<UserRecord>)>, StoreError> {
+        let Some(s) = self.session_by_token(token_hash).await? else { return Ok(None) };
+        let u = self.user(s.user_id).await?;
+        Ok(Some((s, u)))
+    }
     /// Record a request on a session.
     async fn touch_session(&self, id: Uuid, last_seen_ms: i64, ip: Option<&str>) -> Result<(), StoreError>;
     /// The user proved who they are again: give the session a new cookie

@@ -47,7 +47,7 @@ responsibility; doorward gives it what it needs), **Partly**, or **Later**
 | # | L | Requirement (short) | Status | Where it's checked |
 |---|---|---|---|---|
 | 7.1.1 | 2 | Timeouts documented and justified | Met | Session lengths in the plan and `SessionLengths`; apps set them per address |
-| 7.1.2 | 2 | Concurrent sessions documented | Met | Unlimited per account; each listed and endable (`sessions`) |
+| 7.1.2 | 2 | Concurrent sessions documented | Met | Up to 50 per account by default (`max_sessions_per_user`; a sign-in beyond ends the oldest); each listed and endable (`sessions`) |
 | 7.2.1 | 1 | Tokens verified on the backend | Met | Reference tokens looked up by hash on every request |
 | 7.2.2 | 1 | Dynamic tokens, not static secrets | Met | New random token per sign-in |
 | 7.2.3 | 1 | Reference tokens from a CSPRNG, 128+ bits | Met | 256 bits from the OS; `token::tests` |
@@ -78,5 +78,5 @@ responsibility; doorward gives it what it needs), **Partly**, or **Later**
 | 14.3.2 | 2 | `Cache-Control: no-store` on sensitive responses | Met | Every response of the ready-made endpoints, errors included; `http::nothing_is_cacheable`. The app's own pages are the app's |
 | 16.2.1 | 2 | Log entries say when, where, who, what | Met | `EventRecord`: time (UTC ms), address, IP, user, kind |
 | 16.2.5 | 2 | Sensitive data not logged | Met | No passwords, tokens or cookies in logs or in doorward's `Debug` output; `sign_in::debug_output_hides_secrets` |
-| 16.3.1 | 2 | All authentication logged, success and failure | Met | `sign_in`, `sign_in_failed`, `confirm_failed`…, even when the visitor hangs up mid-check; `sign_in::wrong_password_and_unknown_user_look_the_same`, `disconnect` |
+| 16.3.1 | 2 | All authentication logged, success and failure | Met | Every event on the `doorward::security` log target, even when the visitor hangs up mid-check; the store keeps every success and change and rations failures, counting the rest; `sign_in::wrong_password_and_unknown_user_look_the_same`, `disconnect`, `sign_in::failures_kept_in_the_store_are_rationed` |
 | 16.3.3 | 2 | Attempts to bypass controls logged | Met | Cross-origin refusals, refused saved hashes, sessions on the wrong address |

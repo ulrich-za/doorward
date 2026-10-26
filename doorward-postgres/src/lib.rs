@@ -429,6 +429,44 @@ impl Store for PostgresStore {
         row.map(|r| session_of(&r)).transpose().map_err(map_err)
     }
 
+    async fn session_with_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<(SessionRecord, Option<UserRecord>)>, StoreError> {
+        // One round trip: the session, and its user (NULL columns when the
+        // user is gone) with roles.
+        let row = sqlx::query(
+            "SELECT s.id, s.token_hash, s.user_id, s.address, s.created_ms, s.last_seen_ms, s.auth_ms, s.idle_ms,
+                    s.max_ms, s.persistent, s.method, s.ip, s.user_agent,
+                    u.id AS u_id, u.username AS u_username, u.username_key AS u_username_key,
+                    u.username_skeleton AS u_username_skeleton, u.display_name AS u_display_name,
+                    u.active AS u_active, u.created_ms AS u_created_ms,
+                    ARRAY(SELECT role FROM auth_user_roles r WHERE r.user_id = u.id ORDER BY role) AS u_roles
+             FROM auth_sessions s LEFT JOIN auth_users u ON u.id = s.user_id
+             WHERE s.token_hash = $1",
+        )
+        .bind(token_hash.as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_err)?;
+        let Some(r) = row else { return Ok(None) };
+        let session = session_of(&r).map_err(map_err)?;
+        let user = match r.try_get::<Option<Uuid>, _>("u_id").map_err(map_err)? {
+            Some(id) => Some(UserRecord {
+                id,
+                username: r.try_get("u_username").map_err(map_err)?,
+                username_key: r.try_get("u_username_key").map_err(map_err)?,
+                username_skeleton: r.try_get("u_username_skeleton").map_err(map_err)?,
+                display_name: r.try_get("u_display_name").map_err(map_err)?,
+                active: r.try_get("u_active").map_err(map_err)?,
+                created_ms: r.try_get("u_created_ms").map_err(map_err)?,
+                roles: r.try_get::<Option<Vec<String>>, _>("u_roles").map_err(map_err)?.unwrap_or_default(),
+            }),
+            None => None,
+        };
+        Ok(Some((session, user)))
+    }
+
     async fn touch_session(&self, id: Uuid, last_seen_ms: i64, ip: Option<&str>) -> Result<(), StoreError> {
         sqlx::query("UPDATE auth_sessions SET last_seen_ms = $2, ip = $3 WHERE id = $1")
             .bind(id)

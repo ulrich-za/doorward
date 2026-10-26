@@ -197,6 +197,27 @@ async fn sessions<S: Store + ?Sized>(s: &S) {
     let list = s.sessions_for_user(u.id).await.unwrap();
     assert_eq!(list.iter().map(|x| x.id).collect::<Vec<_>>(), vec![b.id, a.id], "newest first");
 
+    // The combined lookup gives the same session and the user, roles included.
+    let (got, owner) = s.session_with_user(&a.token_hash).await.unwrap().expect("session with user");
+    assert_eq!(got, a);
+    let owner = owner.expect("its user");
+    assert_eq!((owner.id, owner.username.as_str()), (u.id, u.username.as_str()));
+    assert_eq!(owner.roles, vec!["admin".to_string(), "tech".to_string()]);
+    assert_eq!(s.user(u.id).await.unwrap(), Some(owner));
+    let (_, theirs_owner) = s.session_with_user(&theirs.token_hash).await.unwrap().unwrap();
+    assert_eq!(theirs_owner.map(|o| o.id), Some(other.id), "each session with its own user");
+    assert_eq!(s.session_with_user(&hash32()).await.unwrap(), None);
+    // It reads the user as they are now, not as they were.
+    let mut changed = s.user(u.id).await.unwrap().unwrap();
+    changed.active = false;
+    assert!(s.update_user(&changed).await.unwrap());
+    assert!(s.set_roles(u.id, &["auditor".into()]).await.unwrap());
+    let (_, now) = s.session_with_user(&a.token_hash).await.unwrap().unwrap();
+    let now = now.unwrap();
+    assert_eq!((now.active, now.roles.clone()), (false, vec!["auditor".to_string()]));
+    changed.active = true;
+    assert!(s.update_user(&changed).await.unwrap());
+
     s.touch_session(a.id, 1_500, Some("192.0.2.9")).await.unwrap();
     let new_hash = hash32();
     assert!(s.reauth_session(a.id, &new_hash, 1_400).await.unwrap());

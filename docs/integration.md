@@ -136,9 +136,31 @@ dw.end_all_sessions(user.id).await?;
 
 Security events go to the `tracing` target `doorward::security` (and to the
 store, readable per user through `events`). Route that target to its own file
-or service. Nothing doorward logs contains a password, token or cookie.
+or service: it gets every event, while the store rations failed attempts
+(per account 50 at once, then one every five minutes; without an account
+100, then one every 30 seconds) and records what it skipped (how many,
+when, from where) in a `failures_not_stored` row at each upkeep. Nothing doorward logs contains a
+password, token or cookie.
 
-## 8. Moving pingrail 0.3's accounts across (pingrail 0.4)
+## 8. Speed
+
+doorward's own work is small next to a password check: about 1 µs to read a
+request, a few µs to look up a session in memory, and around 0.1–0.2 ms of
+CPU around each sign-in. The third of a second each password check takes is
+deliberate (see the threat model). [performance.md](performance.md) has the
+measurements and the cost of each operation.
+
+- **SQLite:** doorward-sqlite keeps one connection; every write waits for the
+  disk (`synchronous = FULL`), which is what makes a sign-out survive a power
+  cut. Leave it unless you accept that trade.
+- **Large hashing memory on Linux:** with 64 MiB or more per check, running
+  the app with `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` lets glibc use huge
+  pages for the hashing memory, so each check spends less time on page
+  faults and calibration fits more passes into the same time.
+- **Sessions:** a user has at most 50 at once by default
+  (`Builder::max_sessions_per_user`); a sign-in beyond that ends the oldest.
+
+## 9. Moving pingrail 0.3's accounts across (pingrail 0.4)
 
 pingrail 0.3 already uses the same Argon2id PHC strings and webauthn-rs
 `Passkey` JSON, so its users keep their passwords and passkeys:
@@ -156,7 +178,7 @@ pingrail 0.3 already uses the same Argon2id PHC strings and webauthn-rs
 Do it once, in a transaction on the app's side, and mark it done (for
 example with `store.meta_set("pingrail.migrated", "1")`).
 
-## 9. Before going public
+## 10. Before going public
 
 - Use HTTPS everywhere (`Address::new` refuses `http://` except for
   `localhost` in development).

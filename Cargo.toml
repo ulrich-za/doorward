@@ -1,6 +1,6 @@
 [package]
 name = "doorward"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Headless sign-in for Rust web apps: machine-sized Argon2id, passkeys, address-bound sessions, lockout-proof rate limits"

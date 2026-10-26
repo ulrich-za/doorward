@@ -105,6 +105,7 @@ and sqlx in one dependency graph, even when one of them is unused.
   stops.
 - [OWASP ASVS 5.0 checklist](docs/asvs.md): each requirement and the test
   that checks it.
+- [Performance](docs/performance.md): what each operation costs, measured.
 - [CHANGELOG](CHANGELOG.md).
 
 ## Testing

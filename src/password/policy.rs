@@ -84,16 +84,22 @@ impl HashPolicy {
     pub fn tune(mem: Option<Memory>) -> Result<HashPolicy, Error> {
         let (mut m, concurrency) = plan_memory(mem);
         loop {
-            match time_pass(m)? {
-                Some(pass) if pass * t_floor(m) as f64 <= SLOW_MS || m == FLOOR_M => {
-                    let t = pick_t(m, pass);
+            match time_hashes(m)? {
+                Some(time) if time.check_ms(t_floor(m)) <= SLOW_MS || m == FLOOR_M => {
+                    // Check the choice with one real hash: on a noisy
+                    // machine the estimate can come out low.
+                    let t = time.passes(m);
+                    let (t, check_ms) = match time_hash(m, t)? {
+                        Some(real_ms) => settle(m, t, time.check_ms(t), real_ms),
+                        None => (t, time.check_ms(t)),
+                    };
                     let policy = HashPolicy {
                         m_kib: m,
                         t,
                         p: 1,
                         concurrency,
                         ram_total: mem.map_or(0, |m| m.total),
-                        check_ms: (pass * t as f64).round().min(u32::MAX as f64) as u32,
+                        check_ms: check_ms.round().min(u32::MAX as f64) as u32,
                         tuned_ms: crate::clock::system_now_ms(),
                     };
                     debug_assert!(policy.is_valid());
@@ -190,24 +196,94 @@ pub fn pick_t(m_kib: u32, pass_ms: f64) -> u32 {
     t.clamp(t_floor(m_kib), MAX_T)
 }
 
-/// How long one Argon2id pass over `m_kib` takes here (best of two), or
-/// `None` when that memory can't be had.
-fn time_pass(m_kib: u32) -> Result<Option<f64>, Error> {
-    let params = Params::new(m_kib, 1, 1, Some(32)).map_err(|_| Error::InvalidHashPolicy)?;
+/// What an Argon2id hash over some memory costs here: a fixed part
+/// (getting and touching the memory) plus each pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Timing {
+    fixed_ms: f64,
+    pass_ms: f64,
+}
+
+impl Timing {
+    /// From the best times with one pass and with two. When the two don't
+    /// agree (a noisy machine), the whole one-pass time is charged to every
+    /// pass, which picks fewer passes, never more.
+    fn from_runs(one_ms: f64, two_ms: f64) -> Timing {
+        let pass = two_ms - one_ms;
+        if pass.is_finite() && pass >= one_ms / 3.0 && pass <= one_ms {
+            Timing { fixed_ms: one_ms - pass, pass_ms: pass }
+        } else {
+            Timing { fixed_ms: 0.0, pass_ms: one_ms }
+        }
+    }
+
+    /// How long a check with `t` passes takes.
+    fn check_ms(&self, t: u32) -> f64 {
+        self.fixed_ms + self.pass_ms * t as f64
+    }
+
+    /// Passes for a check of about 350 ms, never below OWASP's minimum for
+    /// this memory and never above 10.
+    fn passes(&self, m_kib: u32) -> u32 {
+        let t = if self.pass_ms.is_finite() && self.pass_ms > 0.0 {
+            ((TARGET_MS - self.fixed_ms) / self.pass_ms).round().clamp(0.0, MAX_T as f64) as u32
+        } else {
+            MAX_T
+        };
+        t.clamp(t_floor(m_kib), MAX_T)
+    }
+}
+
+/// The passes and check time to settle on, given the estimate (`t` passes,
+/// `estimate_ms`) and one real hash with `t` passes (`real_ms`). A real hash
+/// more than a fifth over the target means the estimate was low: fewer
+/// passes, scaled to the real time, never below OWASP's minimum. The check
+/// time is the larger of the estimate and the real time.
+fn settle(m_kib: u32, t: u32, estimate_ms: f64, real_ms: f64) -> (u32, f64) {
+    if real_ms.is_finite() && real_ms > TARGET_MS * 1.2 && t > t_floor(m_kib) {
+        let fewer = ((t as f64) * TARGET_MS / real_ms).round().max(t_floor(m_kib) as f64) as u32;
+        let per_pass = real_ms / t as f64;
+        return (fewer, (per_pass * fewer as f64).max(estimate_ms * fewer as f64 / t as f64));
+    }
+    (t, if real_ms.is_finite() { estimate_ms.max(real_ms) } else { estimate_ms })
+}
+
+/// One Argon2id hash over `m_kib` with `t` passes, timed. `None` when that
+/// memory can't be had.
+fn time_hash(m_kib: u32, t: u32) -> Result<Option<f64>, Error> {
+    let params = Params::new(m_kib, t, 1, Some(32)).map_err(|_| Error::InvalidHashPolicy)?;
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
     let mut out = [0u8; 32];
-    let mut best = f64::MAX;
-    for _ in 0..2 {
-        let start = Instant::now();
-        match a.hash_password_into(b"doorward calibration", &salt, &mut out) {
-            Ok(()) => best = best.min(start.elapsed().as_secs_f64() * 1000.0),
-            Err(argon2::Error::OutOfMemory) => return Ok(None),
-            Err(_) => return Err(Error::Hashing),
+    let start = Instant::now();
+    match a.hash_password_into(b"doorward calibration", &salt, &mut out) {
+        Ok(()) => Ok(Some(start.elapsed().as_secs_f64() * 1000.0)),
+        Err(argon2::Error::OutOfMemory) => Ok(None),
+        Err(_) => Err(Error::Hashing),
+    }
+}
+
+/// Time Argon2id over `m_kib` here: the best of two hashes with one pass and
+/// two with two passes. `None` when that memory can't be had.
+fn time_hashes(m_kib: u32) -> Result<Option<Timing>, Error> {
+    let mut salt = [0u8; 16];
+    getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
+    let mut out = [0u8; 32];
+    let mut best = [f64::MAX; 2];
+    for (i, t) in [1u32, 2].into_iter().enumerate() {
+        let params = Params::new(m_kib, t, 1, Some(32)).map_err(|_| Error::InvalidHashPolicy)?;
+        let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        for _ in 0..2 {
+            let start = Instant::now();
+            match a.hash_password_into(b"doorward calibration", &salt, &mut out) {
+                Ok(()) => best[i] = best[i].min(start.elapsed().as_secs_f64() * 1000.0),
+                Err(argon2::Error::OutOfMemory) => return Ok(None),
+                Err(_) => return Err(Error::Hashing),
+            }
         }
     }
-    Ok(Some(best))
+    Ok(Some(Timing::from_runs(best[0], best[1])))
 }
 
 fn ram_changed(was: u64, now: Option<Memory>) -> bool {
@@ -258,6 +334,39 @@ mod tests {
         assert_eq!(pick_t(CAP_M, f64::NAN), MAX_T);
         assert_eq!(pick_t(FLOOR_M, f64::INFINITY), MAX_T);
         assert_eq!(pick_t(FLOOR_M, 1e12), 2);
+    }
+
+    #[test]
+    fn passes_allow_for_the_fixed_cost_of_a_hash() {
+        // 80 MiB: 50 ms to get and touch the memory, then 50 ms a pass.
+        let t = Timing::from_runs(100.0, 150.0);
+        assert_eq!(t, Timing { fixed_ms: 50.0, pass_ms: 50.0 });
+        assert_eq!(t.passes(80 * KIB_PER_MIB), 6);
+        assert_eq!(t.check_ms(6), 350.0);
+        // Charging the whole one-pass time to every pass would pick fewer.
+        assert_eq!(pick_t(80 * KIB_PER_MIB, 100.0), 4);
+        // Runs that disagree fall back to that, never to more passes.
+        assert_eq!(Timing::from_runs(100.0, 105.0), Timing { fixed_ms: 0.0, pass_ms: 100.0 });
+        assert_eq!(Timing::from_runs(100.0, 260.0), Timing { fixed_ms: 0.0, pass_ms: 100.0 });
+        assert_eq!(Timing::from_runs(100.0, f64::NAN), Timing { fixed_ms: 0.0, pass_ms: 100.0 });
+        // The floors and the cap still hold.
+        assert_eq!(Timing::from_runs(400.0, 700.0).passes(FLOOR_M), 2);
+        assert_eq!(Timing::from_runs(2.0, 3.0).passes(CAP_M), MAX_T);
+        assert_eq!(Timing { fixed_ms: 500.0, pass_ms: 10.0 }.passes(CAP_M), 1);
+    }
+
+    #[test]
+    fn a_real_hash_corrects_a_low_estimate() {
+        let m = 80 * KIB_PER_MIB;
+        // The estimate said 7 passes in 340 ms, but a real hash took 470 ms.
+        assert_eq!(settle(m, 7, 340.0, 470.0), (5, 470.0 / 7.0 * 5.0));
+        // Within a fifth of the target, the choice stands, at the slower time.
+        assert_eq!(settle(m, 6, 330.0, 400.0), (6, 400.0));
+        assert_eq!(settle(m, 6, 330.0, 300.0), (6, 330.0));
+        // Never below OWASP's minimum for the memory.
+        assert_eq!(settle(FLOOR_M, 2, 300.0, 900.0), (2, 900.0));
+        assert_eq!(settle(m, 3, 300.0, 5000.0), (1, 5000.0 / 3.0));
+        assert_eq!(settle(m, 6, 330.0, f64::NAN), (6, 330.0));
     }
 
     #[test]

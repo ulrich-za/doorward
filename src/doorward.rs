@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use crate::address::{Address, Via};
 use crate::clock::{Clock, SystemClock, ms};
 use crate::error::Error;
-use crate::limits::{Limiter, Limits, Who};
+use crate::limits::{Limiter, Limits, LogBudget, Who};
 use crate::model::{
     NewUser, PasswordRules, SecurityEvent, Session, SessionInfo, SetCookie, SignInMethod, SignedIn, User,
 };
@@ -167,6 +167,7 @@ pub struct Builder {
     event_retention: Duration,
     rp_name: String,
     max_passkeys_per_user: usize,
+    max_sessions_per_user: usize,
     refused_words: Vec<String>,
 }
 
@@ -290,6 +291,13 @@ impl Builder {
         self
     }
 
+    /// Most sessions one user may have at once (default 50, at most 1,000).
+    /// A sign-in beyond that ends the user's oldest sessions.
+    pub fn max_sessions_per_user(mut self, n: usize) -> Builder {
+        self.max_sessions_per_user = n;
+        self
+    }
+
     /// Check the settings, upgrade the store, and load (or, on first start,
     /// time) the password hash policy. Tuning takes a second or two.
     pub async fn build(self) -> Result<Doorward, Error> {
@@ -336,6 +344,9 @@ impl Builder {
         if !(1..=100).contains(&self.max_passkeys_per_user) {
             return Err(Error::Config("passkeys per user must be 1–100".into()));
         }
+        if !(1..=1000).contains(&self.max_sessions_per_user) {
+            return Err(Error::Config("sessions per user must be 1–1,000".into()));
+        }
         self.limits.check()?;
         self.store.migrate().await?;
 
@@ -375,10 +386,12 @@ impl Builder {
             rules: self.rules,
             recent: self.recent,
             limiter: Limiter::new(self.limits),
+            log_budget: LogBudget::new(),
             visitor_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             hash_wait: self.hash_wait,
             event_retention: self.event_retention,
             max_passkeys: self.max_passkeys_per_user,
+            max_sessions: self.max_sessions_per_user,
             refused_words: self.refused_words,
             #[cfg(feature = "passkeys")]
             passkeys,
@@ -400,6 +413,8 @@ pub(crate) struct Inner {
     rules: PasswordRules,
     recent: Duration,
     pub(crate) limiter: Limiter,
+    /// Rations the failure events written to the store.
+    log_budget: LogBudget,
     /// Visitors without a remembered browser check one password at a time,
     /// so of the one or two checks the machine allows, room is left for
     /// remembered browsers even during a flood of guesses.
@@ -408,6 +423,7 @@ pub(crate) struct Inner {
     event_retention: Duration,
     #[cfg_attr(not(feature = "passkeys"), allow(dead_code))]
     pub(crate) max_passkeys: usize,
+    max_sessions: usize,
     refused_words: Vec<String>,
     #[cfg(feature = "passkeys")]
     pub(crate) passkeys: crate::passkey::Passkeys,
@@ -476,6 +492,7 @@ impl Doorward {
             event_retention: Duration::from_secs(90 * 86_400),
             rp_name: "doorward".into(),
             max_passkeys_per_user: 20,
+            max_sessions_per_user: 50,
             refused_words: Vec::new(),
         }
     }
@@ -596,7 +613,7 @@ impl Doorward {
         self.refuse_cross_origin(v)?;
         let Some(hash) = token::hash_token(token) else { return Ok(None) };
         let store = &self.0.store;
-        let Some(rec) = store.session_by_token(&hash).await? else { return Ok(None) };
+        let Some((rec, user)) = store.session_with_user(&hash).await? else { return Ok(None) };
         let now = self.now();
         if rec.address != self.address_of(v).origin() {
             // A cookie can't normally travel to another origin; if one does,
@@ -608,7 +625,7 @@ impl Doorward {
             store.delete_session(rec.id).await?;
             return Ok(None);
         }
-        let Some(user) = store.user(rec.user_id).await? else {
+        let Some(user) = user else {
             store.delete_session(rec.id).await?;
             return Ok(None);
         };
@@ -722,13 +739,27 @@ impl Doorward {
             return Err(Error::PasswordsDisabledHere);
         }
         let store = &self.0.store;
+        // Without a remembered browser the attempt counts against the
+        // visitor, whoever it is for, so check that budget before any other
+        // work: a refused attempt then costs no lookup, for any name alike.
+        let device = self.remembered(v).await?;
+        if device.is_none() {
+            self.admit(Who::Visitor(v.key)).await?;
+        }
         let user = match username::lookup_key(username) {
             Some(k) => store.user_by_key(&k).await?,
             None => None,
         };
+        // A name that doesn't exist counts like someone else's account (see
+        // `who`), so the budget used can't tell which names exist.
         let user_id = user.as_ref().map_or(Uuid::nil(), |u| u.id);
-        let (who, device) = self.who(v, Some(user_id)).await?;
-        self.admit(who).await?;
+        let who = match &device {
+            Some(d) if d.user_id == user_id => Who::Remembered(d.user_id),
+            _ => Who::Visitor(v.key),
+        };
+        if device.is_some() {
+            self.admit(who).await?;
+        }
 
         // Look a hash up even for an unknown user, so both take the same steps.
         let phc = store.password(user_id).await?;
@@ -800,6 +831,19 @@ impl Doorward {
             inner.store.delete_session(old.id).await?;
         }
         inner.store.insert_session(&rec).await?;
+        // Keep only the user's newest sessions, so signing in over and over
+        // can't pile them up.
+        let mine = inner.store.sessions_for_user(user.id).await?;
+        if mine.len() > inner.max_sessions {
+            let mut ended = 0;
+            for old in mine.iter().filter(|s| s.id != rec.id).skip(inner.max_sessions - 1) {
+                if inner.store.delete_session(old.id).await? {
+                    ended += 1;
+                }
+            }
+            let detail = format!(r#"{{"count":{ended},"reason":"too_many_sessions"}}"#);
+            self.event(Some(user.id), "sessions_ended", Some(v), Some(&detail)).await;
+        }
         let mut cookies = vec![SetCookie::set(
             &inner.cookie,
             &token,
@@ -1222,6 +1266,17 @@ impl Doorward {
         s.prune_sessions(now).await?;
         s.prune_remembered(now).await?;
         s.prune_events(now - ms(self.0.event_retention)).await?;
+        for (user, dropped) in self.0.log_budget.take_dropped(now) {
+            tracing::warn!(target: "doorward::security", user = %user.map(|u| u.to_string()).unwrap_or_default(), count = dropped.count, "failures not kept in the store (all are on this log target)");
+            // An account deleted since can't own log rows: report it without
+            // one, naming it in the detail.
+            let owner = match user {
+                Some(u) if s.user(u).await?.is_some() => Some(u),
+                _ => None,
+            };
+            let named = if owner.is_none() { user } else { None };
+            self.store_event(owner, "failures_not_stored", None, Some(&dropped.to_json(named))).await;
+        }
         self.0.limiter.tidy(now);
         #[cfg(feature = "passkeys")]
         self.0.passkeys.tidy(now);
@@ -1244,9 +1299,12 @@ impl Doorward {
 
     // ----- the security log -----------------------------------------------------------
 
-    /// Record a security event in the store and on the `doorward::security`
-    /// log target. Never fails the caller: a log that can't be written is
-    /// reported on the log target instead.
+    /// Record a security event on the `doorward::security` log target and in
+    /// the store. Every event reaches the log target; failures reach the
+    /// store as far as their ration allows (see [`LogBudget`]), and the rest
+    /// are counted in a `failures_not_stored` row at the next upkeep. Never
+    /// fails the caller: a log that can't be written is reported on the log
+    /// target instead.
     pub(crate) async fn event(&self, user: Option<Uuid>, kind: &str, v: Option<&Visit>, detail: Option<&str>) {
         let address = v.map(|v| self.address_of(v).origin().to_string());
         let ip = v.map(|v| v.ip.to_string());
@@ -1254,9 +1312,33 @@ impl Doorward {
         let failure = kind.ends_with("_failed") || kind.ends_with("_refused");
         if failure {
             tracing::warn!(target: "doorward::security", kind, user = %user_s, ip = ip.as_deref().unwrap_or(""), address = address.as_deref().unwrap_or(""), detail = detail.unwrap_or(""));
+            // Only failed attempts are rationed: a `_refused` event (such as
+            // the right password for a disabled account) needs a valid
+            // credential, so it can't be produced cheaply, and is always kept.
+            if kind.ends_with("_failed") && !self.0.log_budget.allow(user, v.map(|v| v.ip), self.now()) {
+                return;
+            }
         } else {
             tracing::info!(target: "doorward::security", kind, user = %user_s, ip = ip.as_deref().unwrap_or(""), address = address.as_deref().unwrap_or(""), detail = detail.unwrap_or(""));
         }
+        self.write_event(user, kind, address, ip, detail).await;
+    }
+
+    /// Store an event without logging it again or rationing it.
+    async fn store_event(&self, user: Option<Uuid>, kind: &str, v: Option<&Visit>, detail: Option<&str>) {
+        let address = v.map(|v| self.address_of(v).origin().to_string());
+        let ip = v.map(|v| v.ip.to_string());
+        self.write_event(user, kind, address, ip, detail).await;
+    }
+
+    async fn write_event(
+        &self,
+        user: Option<Uuid>,
+        kind: &str,
+        address: Option<String>,
+        ip: Option<String>,
+        detail: Option<&str>,
+    ) {
         let e = EventRecord {
             id: 0,
             at_ms: self.now(),

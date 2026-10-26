@@ -1,9 +1,10 @@
 # doorward threat model
 
 This is what doorward defends, against whom, how, and where its protection
-stops. Each defence names the test that checks it. It covers doorward 0.1.0,
-including the fixes from the review before its release (each finding is now a
-regression test, listed under "Reviewed before release").
+stops. Each defence names the test that checks it. It covers doorward 0.1.1,
+including the fixes from the review before 0.1.0 (each finding is now a
+regression test, listed under "Reviewed before release") and from the
+performance analysis for 0.1.1 ([performance.md](performance.md)).
 
 ## What is protected
 
@@ -59,6 +60,13 @@ browser ──HTTPS──▶ [cloudflared / reverse proxy] ──HTTPS──▶ 
   `sign_in::new_remembered_cookies_give_no_extra_guesses`.
 - A guess is counted even when the visitor hangs up mid-check: the check and
   its counting run on their own, and finish. `disconnect` (a real server).
+- A visitor without a remembered-browser cookie is checked against its
+  budget before any other work, so a refused attempt costs no store lookup
+  (with such a cookie, the cookie is looked up first, and any name other
+  than the cookie owner's takes the same steps), and usernames are
+  normalised only up to the length limit.
+  `store_calls::a_refused_attempt_costs_no_store_work`,
+  `store_calls::with_a_remembered_browser_any_other_name_takes_the_same_steps`.
 - Accounts are never locked (a lock anyone can trigger is a denial of
   service). Same test as the flood above.
 - New passwords: at least 8 characters by default (apps can ask for 15), none
@@ -101,7 +109,10 @@ browser ──HTTPS──▶ [cloudflared / reverse proxy] ──HTTPS──▶ 
 - The tables that track visitors are bounded. A visitor that is being
   refused is never forgotten to make room while others can be, so a flood of
   fresh addresses (even failing ones) can't wash it out; only past twice the
-  table's size are the refusals that end soonest forgotten.
+  table's size are the refusals that end soonest forgotten. A table full of
+  refusals is scanned for room once per tenth of its size, not for every
+  newcomer, so such a flood can't make each request slow.
+  `limits::tests::a_table_full_of_refusals_is_scanned_once_per_tenth`.
   `limits::tests::a_failing_flood_cant_wash_out_a_refused_visitor`,
   `limits::tests::refused_entries_stay_bounded`,
   `sign_in::a_failing_flood_cant_wash_out_a_refused_visitor`.
@@ -111,10 +122,16 @@ browser ──HTTPS──▶ [cloudflared / reverse proxy] ──HTTPS──▶ 
 - Unknown usernames and wrong passwords give the same error, take the same
   store steps, and check a stand-in hash made with the current settings. A
   real user's hash may still have older, cheaper settings (until their next
-  sign-in), so every answer is held back until a check with the current
-  settings would have finished. `sign_in::wrong_password_and_unknown_user_look_the_same`,
+  sign-in, for example after a retune), so every answer is held back to a
+  floor above a normal check: a quarter more than the slowest of the
+  calibrated time and two checks timed at start, raised to a tenth more
+  than the slowest of the last 16 current-settings checks when the machine
+  is busy. Answers for unknown names and for older hashes then both come at
+  the floor. `sign_in::wrong_password_and_unknown_user_look_the_same`,
   `sign_in::unknown_names_take_as_long_after_the_hashing_is_retuned`,
-  `password::tests::answers_never_come_sooner_than_a_current_check`.
+  `password::tests::answers_never_come_sooner_than_a_current_check`,
+  `timing::older_hashes_answer_no_sooner_than_unknown_names`,
+  `password::tests::the_floor_follows_slow_checks_up_to_a_cap`.
 - An account holder's own remembered browser doesn't help: attempts at names
   that don't exist count against the same budget as attempts at other
   people's accounts. `sign_in::an_own_remembered_browser_reveals_no_usernames`.
@@ -196,6 +213,8 @@ browser ──HTTPS──▶ [cloudflared / reverse proxy] ──HTTPS──▶ 
   `sign_in::disabling_an_account_forgets_its_remembered_browsers`.
 - Adding or removing a passkey ends every other session.
   `passkeys::adding_a_passkey_needs_a_recent_sign_in_and_ends_other_sessions`.
+- A user has at most 50 sessions (`max_sessions_per_user`); a sign-in
+  beyond that ends the oldest. `sign_in::sign_ins_beyond_the_session_limit_end_the_oldest`.
 - Every sign-in gets a new cookie and ends the one the browser had, so a
   planted cookie can't ride along (session fixation).
   `sign_in::a_new_sign_in_replaces_a_planted_cookie`.
@@ -232,6 +251,18 @@ browser ──HTTPS──▶ [cloudflared / reverse proxy] ──HTTPS──▶ 
   `Cache-Control: no-store`. `http::nothing_is_cacheable`.
 - Security events go to their own log target (`doorward::security`) and to
   the store, with who, when, where and what.
+- Every event reaches the log target. In the store, failed attempts are
+  rationed (per account 50 at once, then one every five minutes; without an
+  account 100 at once, then one every 30 seconds) and the rest are reported
+  in a `failures_not_stored` row at the next upkeep, with the count, the
+  first and last time and the first few addresses, so a flood of cheap
+  failures (a wrong passkey answer costs no hashing) can't fill the
+  database or crowd out its writes. Someone who knows a username can use
+  up that account's 50 stored rows with junk; later failures are then only
+  counted in the store (and fully on the log target). `_refused` events,
+  which need a valid credential, are never rationed. `limits::tests::stored_failures_are_rationed_per_account_and_without_one`,
+  `sign_in::failures_kept_in_the_store_are_rationed`,
+  `passkeys::failures_with_no_account_are_rationed_in_the_store`.
 
 ## Where protection stops
 
