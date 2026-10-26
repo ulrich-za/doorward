@@ -38,5 +38,23 @@ async fn older_hashes_answer_no_sooner_than_unknown_names() {
     unknown.sort_by(f64::total_cmp);
     old.sort_by(f64::total_cmp);
     let (u, o) = (unknown[10], old[10]);
-    assert!((u - o).abs() <= 0.04 * u, "median answer: unknown name {u:.4} s, older hash {o:.4} s");
+    // Answers end with a sleep, so the OS timer's granularity (about 15 ms
+    // on Windows, well under 1 ms elsewhere) blurs them; allow for it.
+    let tick = timer_granularity().await;
+    let allowed = 0.04 * u + 2.0 * tick;
+    assert!(
+        (u - o).abs() <= allowed,
+        "median answer: unknown name {u:.4} s, older hash {o:.4} s (timer granularity {tick:.4} s)"
+    );
+}
+
+/// How much later than asked a short sleep wakes up here (the worst of five).
+async fn timer_granularity() -> f64 {
+    let mut worst = 0.0f64;
+    for _ in 0..5 {
+        let t = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        worst = worst.max(t.elapsed().as_secs_f64() - 0.001);
+    }
+    worst.max(0.0)
 }

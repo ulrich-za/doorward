@@ -44,8 +44,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
-      - run: cargo test --workspace --features axum,passkeys,vendored-openssl,test-util
-      - run: cargo test -p doorward --no-default-features
+      - name: Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --features axum,passkeys,vendored-openssl,test-util 2>&1 | tee test-all.log
+      - name: Tests without default features
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p doorward --no-default-features 2>&1 | tee test-min.log
+      # Failing tests as annotations, readable without the full log.
+      - name: Name the failing tests
+        if: failure()
+        shell: bash
+        run: grep -hE "^---- .* stdout ----$|panicked at|^test .* FAILED$|^thread '.*' panicked" test-*.log | head -10 | sed 's/^/::error::/' || true
 
   msrv:
     runs-on: ubuntu-latest
