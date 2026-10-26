@@ -1,6 +1,6 @@
 [package]
 name = "doorward-postgres"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "PostgreSQL storage for doorward (sign-in for Rust web apps), through sqlx"
@@ -15,14 +15,14 @@ categories = ["authentication", "database"]
 [workspace]
 
 [dependencies]
-doorward = { version = "0.1.0", path = "..", default-features = false }
+doorward = { version = "0.1.1", path = "..", default-features = false }
 async-trait = "0.1.89"
 # The app chooses TLS for its connection pool; doorward adds no TLS backend.
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "uuid"] }
 uuid = { version = "1.18", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-doorward = { version = "0.1.0", path = "..", features = ["test-util"] }
+doorward = { version = "0.1.1", path = "..", features = ["test-util"] }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
 http = "1.3"
 uuid = { version = "1.18", features = ["v4"] }

@@ -162,6 +162,7 @@ impl SqliteStore {
         // WAL is refused for in-memory databases; that is fine.
         let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0));
         let fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).map_err(backend)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         if fk != 1 {
             return Err(backend("SQLite foreign keys can't be turned on"));
         }
@@ -208,7 +209,13 @@ fn hash_col(r: &Row<'_>, i: usize) -> rusqlite::Result<[u8; 32]> {
     v.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(i, "token_hash".into(), rusqlite::types::Type::Blob))
 }
 
-const USER_COLS: &str = "id, username, username_key, username_skeleton, display_name, active, created_ms";
+/// The user columns, in `user_row`'s order (a macro so SQL can be built
+/// with `concat!` and cached as a constant string).
+macro_rules! user_cols {
+    () => {
+        "id, username, username_key, username_skeleton, display_name, active, created_ms"
+    };
+}
 
 fn user_row(r: &Row<'_>) -> rusqlite::Result<UserRecord> {
     Ok(UserRecord {
@@ -231,7 +238,12 @@ fn with_roles(c: &Connection, mut u: UserRecord) -> Result<UserRecord, StoreErro
     Ok(u)
 }
 
-const SESSION_COLS: &str = "id, token_hash, user_id, address, created_ms, last_seen_ms, auth_ms, idle_ms, max_ms, persistent, method, ip, user_agent";
+/// The session columns, in `session_row`'s order.
+macro_rules! session_cols {
+    () => {
+        "id, token_hash, user_id, address, created_ms, last_seen_ms, auth_ms, idle_ms, max_ms, persistent, method, ip, user_agent"
+    };
+}
 
 fn session_row(r: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -249,6 +261,24 @@ fn session_row(r: &Row<'_>) -> rusqlite::Result<SessionRecord> {
         ip: r.get(11)?,
         user_agent: r.get(12)?,
     })
+}
+
+fn user_by_id(c: &Connection, id: Uuid) -> Result<Option<UserRecord>, StoreError> {
+    let u = c
+        .row_cached(concat!("SELECT ", user_cols!(), " FROM auth_users WHERE id = ?1"), [id.to_string()], user_row)
+        .optional()
+        .map_err(map_err)?;
+    u.map(|u| with_roles(c, u)).transpose()
+}
+
+fn session_by_hash(c: &Connection, h: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError> {
+    c.row_cached(
+        concat!("SELECT ", session_cols!(), " FROM auth_sessions WHERE token_hash = ?1"),
+        [h.as_slice()],
+        session_row,
+    )
+    .optional()
+    .map_err(map_err)
 }
 
 fn remembered_row(r: &Row<'_>) -> rusqlite::Result<RememberedRecord> {
@@ -274,9 +304,36 @@ fn passkey_row(r: &Row<'_>) -> rusqlite::Result<PasskeyRecord> {
     })
 }
 
+/// Statements from the connection's cache, so each SQL text is parsed once
+/// rather than on every call.
+trait Cached {
+    fn exec_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+    fn row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl Cached for Connection {
+    fn exec_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
+/// Room in the statement cache for every statement this store uses.
+const STATEMENT_CACHE: usize = 64;
+
 fn set_roles_tx(tx: &Connection, user: Uuid, roles: &[String]) -> Result<(), StoreError> {
     let id = user.to_string();
-    tx.execute("DELETE FROM auth_user_roles WHERE user_id = ?1", [&id]).map_err(map_err)?;
+    tx.exec_cached("DELETE FROM auth_user_roles WHERE user_id = ?1", [&id]).map_err(map_err)?;
     let mut st =
         tx.prepare_cached("INSERT OR IGNORE INTO auth_user_roles (user_id, role) VALUES (?1, ?2)").map_err(map_err)?;
     for r in roles {
@@ -291,7 +348,7 @@ impl Store for SqliteStore {
         self.run(|c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(map_err)?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS auth_schema (version INTEGER NOT NULL)").map_err(map_err)?;
-            let v: Option<i64> = tx.query_row("SELECT MAX(version) FROM auth_schema", [], |r| r.get(0)).map_err(map_err)?;
+            let v: Option<i64> = tx.row_cached("SELECT MAX(version) FROM auth_schema", [], |r| r.get(0)).map_err(map_err)?;
             let v = v.unwrap_or(0);
             if v > SCHEMA {
                 return Err(backend(format!(
@@ -300,7 +357,7 @@ impl Store for SqliteStore {
             }
             if v < 1 {
                 tx.execute_batch(V1).map_err(map_err)?;
-                tx.execute("INSERT INTO auth_schema (version) VALUES (1)", []).map_err(map_err)?;
+                tx.exec_cached("INSERT INTO auth_schema (version) VALUES (1)", []).map_err(map_err)?;
             }
             tx.commit().map_err(map_err)
         })
@@ -310,7 +367,7 @@ impl Store for SqliteStore {
     async fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
         let key = key.to_string();
         self.run(move |c| {
-            c.query_row("SELECT value FROM auth_meta WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(map_err)
+            c.row_cached("SELECT value FROM auth_meta WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(map_err)
         })
         .await
     }
@@ -318,7 +375,7 @@ impl Store for SqliteStore {
     async fn meta_set(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let (key, value) = (key.to_string(), value.to_string());
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "INSERT INTO auth_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, value],
             )
@@ -332,8 +389,8 @@ impl Store for SqliteStore {
         let u = u.clone();
         self.run(move |c| {
             let tx = c.transaction().map_err(map_err)?;
-            tx.execute(
-                &format!("INSERT INTO auth_users ({USER_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+            tx.exec_cached(
+                concat!("INSERT INTO auth_users (", user_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
                 params![
                     u.id.to_string(),
                     u.username,
@@ -352,21 +409,18 @@ impl Store for SqliteStore {
     }
 
     async fn user(&self, id: Uuid) -> Result<Option<UserRecord>, StoreError> {
-        self.run(move |c| {
-            let u = c
-                .query_row(&format!("SELECT {USER_COLS} FROM auth_users WHERE id = ?1"), [id.to_string()], user_row)
-                .optional()
-                .map_err(map_err)?;
-            u.map(|u| with_roles(c, u)).transpose()
-        })
-        .await
+        self.run(move |c| user_by_id(c, id)).await
     }
 
     async fn user_by_key(&self, key: &str) -> Result<Option<UserRecord>, StoreError> {
         let key = key.to_string();
         self.run(move |c| {
             let u = c
-                .query_row(&format!("SELECT {USER_COLS} FROM auth_users WHERE username_key = ?1"), [key], user_row)
+                .row_cached(
+                    concat!("SELECT ", user_cols!(), " FROM auth_users WHERE username_key = ?1"),
+                    [key],
+                    user_row,
+                )
                 .optional()
                 .map_err(map_err)?;
             u.map(|u| with_roles(c, u)).transpose()
@@ -376,8 +430,9 @@ impl Store for SqliteStore {
 
     async fn users(&self) -> Result<Vec<UserRecord>, StoreError> {
         self.run(|c| {
-            let mut st =
-                c.prepare(&format!("SELECT {USER_COLS} FROM auth_users ORDER BY username_key")).map_err(map_err)?;
+            let mut st = c
+                .prepare_cached(concat!("SELECT ", user_cols!(), " FROM auth_users ORDER BY username_key"))
+                .map_err(map_err)?;
             let users: Vec<UserRecord> =
                 st.query_map([], user_row).map_err(map_err)?.collect::<Result<_, _>>().map_err(map_err)?;
             users.into_iter().map(|u| with_roles(c, u)).collect()
@@ -389,7 +444,7 @@ impl Store for SqliteStore {
         let u = u.clone();
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "UPDATE auth_users SET username = ?2, username_key = ?3, username_skeleton = ?4, display_name = ?5, active = ?6 WHERE id = ?1",
                     params![u.id.to_string(), u.username, u.username_key, u.username_skeleton, u.display_name, u.active as i64],
                 )
@@ -404,7 +459,7 @@ impl Store for SqliteStore {
         self.run(move |c| {
             let tx = c.transaction().map_err(map_err)?;
             let exists: Option<i64> = tx
-                .query_row("SELECT 1 FROM auth_users WHERE id = ?1", [user_id.to_string()], |r| r.get(0))
+                .row_cached("SELECT 1 FROM auth_users WHERE id = ?1", [user_id.to_string()], |r| r.get(0))
                 .optional()
                 .map_err(map_err)?;
             if exists.is_none() {
@@ -418,13 +473,15 @@ impl Store for SqliteStore {
     }
 
     async fn delete_user(&self, id: Uuid) -> Result<bool, StoreError> {
-        self.run(move |c| Ok(c.execute("DELETE FROM auth_users WHERE id = ?1", [id.to_string()]).map_err(map_err)? > 0))
-            .await
+        self.run(move |c| {
+            Ok(c.exec_cached("DELETE FROM auth_users WHERE id = ?1", [id.to_string()]).map_err(map_err)? > 0)
+        })
+        .await
     }
 
     async fn password(&self, user_id: Uuid) -> Result<Option<String>, StoreError> {
         self.run(move |c| {
-            c.query_row("SELECT phc FROM auth_passwords WHERE user_id = ?1", [user_id.to_string()], |r| r.get(0))
+            c.row_cached("SELECT phc FROM auth_passwords WHERE user_id = ?1", [user_id.to_string()], |r| r.get(0))
                 .optional()
                 .map_err(map_err)
         })
@@ -434,7 +491,7 @@ impl Store for SqliteStore {
     async fn set_password(&self, user_id: Uuid, phc: &str, at_ms: i64) -> Result<(), StoreError> {
         let phc = phc.to_string();
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "INSERT INTO auth_passwords (user_id, phc, updated_ms) VALUES (?1, ?2, ?3)
                  ON CONFLICT(user_id) DO UPDATE SET phc = excluded.phc, updated_ms = excluded.updated_ms",
                 params![user_id.to_string(), phc, at_ms],
@@ -449,7 +506,7 @@ impl Store for SqliteStore {
         let (old, new) = (old.to_string(), new.to_string());
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "UPDATE auth_passwords SET phc = ?3, updated_ms = ?4 WHERE user_id = ?1 AND phc = ?2",
                     params![user_id.to_string(), old, new, at_ms],
                 )
@@ -461,7 +518,9 @@ impl Store for SqliteStore {
 
     async fn remove_password(&self, user_id: Uuid) -> Result<bool, StoreError> {
         self.run(move |c| {
-            Ok(c.execute("DELETE FROM auth_passwords WHERE user_id = ?1", [user_id.to_string()]).map_err(map_err)? > 0)
+            Ok(c.exec_cached("DELETE FROM auth_passwords WHERE user_id = ?1", [user_id.to_string()])
+                .map_err(map_err)?
+                > 0)
         })
         .await
     }
@@ -469,8 +528,12 @@ impl Store for SqliteStore {
     async fn insert_session(&self, s: &SessionRecord) -> Result<(), StoreError> {
         let s = s.clone();
         self.run(move |c| {
-            c.execute(
-                &format!("INSERT INTO auth_sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
+            c.exec_cached(
+                concat!(
+                    "INSERT INTO auth_sessions (",
+                    session_cols!(),
+                    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                ),
                 params![
                     s.id.to_string(),
                     s.token_hash.as_slice(),
@@ -495,14 +558,18 @@ impl Store for SqliteStore {
 
     async fn session_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError> {
         let h = *token_hash;
+        self.run(move |c| session_by_hash(c, &h)).await
+    }
+
+    async fn session_with_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<(SessionRecord, Option<UserRecord>)>, StoreError> {
+        let h = *token_hash;
         self.run(move |c| {
-            c.query_row(
-                &format!("SELECT {SESSION_COLS} FROM auth_sessions WHERE token_hash = ?1"),
-                [h.as_slice()],
-                session_row,
-            )
-            .optional()
-            .map_err(map_err)
+            let Some(s) = session_by_hash(c, &h)? else { return Ok(None) };
+            let u = user_by_id(c, s.user_id)?;
+            Ok(Some((s, u)))
         })
         .await
     }
@@ -510,7 +577,7 @@ impl Store for SqliteStore {
     async fn touch_session(&self, id: Uuid, last_seen_ms: i64, ip: Option<&str>) -> Result<(), StoreError> {
         let ip = ip.map(String::from);
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "UPDATE auth_sessions SET last_seen_ms = ?2, ip = ?3 WHERE id = ?1",
                 params![id.to_string(), last_seen_ms, ip],
             )
@@ -524,7 +591,7 @@ impl Store for SqliteStore {
         let h = *token_hash;
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "UPDATE auth_sessions SET token_hash = ?2, auth_ms = ?3 WHERE id = ?1",
                     params![id.to_string(), h.as_slice(), auth_ms],
                 )
@@ -536,7 +603,7 @@ impl Store for SqliteStore {
 
     async fn delete_session(&self, id: Uuid) -> Result<bool, StoreError> {
         self.run(move |c| {
-            Ok(c.execute("DELETE FROM auth_sessions WHERE id = ?1", [id.to_string()]).map_err(map_err)? > 0)
+            Ok(c.exec_cached("DELETE FROM auth_sessions WHERE id = ?1", [id.to_string()]).map_err(map_err)? > 0)
         })
         .await
     }
@@ -544,8 +611,10 @@ impl Store for SqliteStore {
     async fn sessions_for_user(&self, user_id: Uuid) -> Result<Vec<SessionRecord>, StoreError> {
         self.run(move |c| {
             let mut st = c
-                .prepare_cached(&format!(
-                    "SELECT {SESSION_COLS} FROM auth_sessions WHERE user_id = ?1 ORDER BY created_ms DESC, id"
+                .prepare_cached(concat!(
+                    "SELECT ",
+                    session_cols!(),
+                    " FROM auth_sessions WHERE user_id = ?1 ORDER BY created_ms DESC, id"
                 ))
                 .map_err(map_err)?;
             st.query_map([user_id.to_string()], session_row)
@@ -559,7 +628,7 @@ impl Store for SqliteStore {
     async fn delete_sessions_for_user(&self, user_id: Uuid, keep: Option<Uuid>) -> Result<u64, StoreError> {
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "DELETE FROM auth_sessions WHERE user_id = ?1 AND (?2 IS NULL OR id <> ?2)",
                     params![user_id.to_string(), keep.map(|k| k.to_string())],
                 )
@@ -572,7 +641,7 @@ impl Store for SqliteStore {
     async fn prune_sessions(&self, now_ms: i64) -> Result<u64, StoreError> {
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "DELETE FROM auth_sessions WHERE created_ms <= ?1 - max_ms
                      OR (idle_ms IS NOT NULL AND last_seen_ms <= ?1 - idle_ms)",
                     [now_ms],
@@ -586,7 +655,7 @@ impl Store for SqliteStore {
     async fn insert_remembered(&self, r: &RememberedRecord) -> Result<(), StoreError> {
         let r = r.clone();
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "INSERT INTO auth_remembered (token_hash, user_id, created_ms, last_used_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(token_hash) DO UPDATE SET user_id = excluded.user_id, created_ms = excluded.created_ms,
                  last_used_ms = excluded.last_used_ms, expires_ms = excluded.expires_ms",
@@ -601,7 +670,7 @@ impl Store for SqliteStore {
     async fn remembered(&self, token_hash: &[u8; 32]) -> Result<Option<RememberedRecord>, StoreError> {
         let h = *token_hash;
         self.run(move |c| {
-            c.query_row(
+            c.row_cached(
                 "SELECT token_hash, user_id, created_ms, last_used_ms, expires_ms FROM auth_remembered WHERE token_hash = ?1",
                 [h.as_slice()],
                 remembered_row,
@@ -620,7 +689,7 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         let h = *token_hash;
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "UPDATE auth_remembered SET last_used_ms = ?2, expires_ms = ?3 WHERE token_hash = ?1",
                 params![h.as_slice(), last_used_ms, expires_ms],
             )
@@ -633,7 +702,7 @@ impl Store for SqliteStore {
     async fn delete_remembered(&self, token_hash: &[u8; 32]) -> Result<(), StoreError> {
         let h = *token_hash;
         self.run(move |c| {
-            c.execute("DELETE FROM auth_remembered WHERE token_hash = ?1", [h.as_slice()]).map_err(map_err)?;
+            c.exec_cached("DELETE FROM auth_remembered WHERE token_hash = ?1", [h.as_slice()]).map_err(map_err)?;
             Ok(())
         })
         .await
@@ -641,15 +710,15 @@ impl Store for SqliteStore {
 
     async fn delete_remembered_for_user(&self, user_id: Uuid) -> Result<u64, StoreError> {
         self.run(move |c| {
-            Ok(c.execute("DELETE FROM auth_remembered WHERE user_id = ?1", [user_id.to_string()]).map_err(map_err)?
-                as u64)
+            Ok(c.exec_cached("DELETE FROM auth_remembered WHERE user_id = ?1", [user_id.to_string()])
+                .map_err(map_err)? as u64)
         })
         .await
     }
 
     async fn trim_remembered(&self, user_id: Uuid, keep: u32) -> Result<u64, StoreError> {
         self.run(move |c| {
-            Ok(c.execute(
+            Ok(c.exec_cached(
                 "DELETE FROM auth_remembered WHERE user_id = ?1 AND token_hash NOT IN (
                      SELECT token_hash FROM auth_remembered WHERE user_id = ?1
                      ORDER BY created_ms DESC, token_hash DESC LIMIT ?2)",
@@ -662,7 +731,7 @@ impl Store for SqliteStore {
 
     async fn prune_remembered(&self, now_ms: i64) -> Result<u64, StoreError> {
         self.run(move |c| {
-            Ok(c.execute("DELETE FROM auth_remembered WHERE expires_ms <= ?1", [now_ms]).map_err(map_err)? as u64)
+            Ok(c.exec_cached("DELETE FROM auth_remembered WHERE expires_ms <= ?1", [now_ms]).map_err(map_err)? as u64)
         })
         .await
     }
@@ -670,7 +739,7 @@ impl Store for SqliteStore {
     async fn insert_passkey(&self, p: &PasskeyRecord) -> Result<(), StoreError> {
         let p = p.clone();
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "INSERT INTO auth_passkeys (id, user_id, rp_id, cred_id, passkey, label, created_ms, last_used_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -709,7 +778,7 @@ impl Store for SqliteStore {
     async fn passkey_used(&self, id: Uuid, passkey_json: Option<&str>, at_ms: i64) -> Result<(), StoreError> {
         let json = passkey_json.map(String::from);
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "UPDATE auth_passkeys SET last_used_ms = ?2, passkey = COALESCE(?3, passkey) WHERE id = ?1",
                 params![id.to_string(), at_ms, json],
             )
@@ -723,7 +792,7 @@ impl Store for SqliteStore {
         let label = label.to_string();
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "UPDATE auth_passkeys SET label = ?3 WHERE id = ?1 AND user_id = ?2",
                     params![id.to_string(), user_id.to_string(), label],
                 )
@@ -736,7 +805,7 @@ impl Store for SqliteStore {
     async fn delete_passkey(&self, id: Uuid, user_id: Uuid) -> Result<bool, StoreError> {
         self.run(move |c| {
             let n = c
-                .execute(
+                .exec_cached(
                     "DELETE FROM auth_passkeys WHERE id = ?1 AND user_id = ?2",
                     params![id.to_string(), user_id.to_string()],
                 )
@@ -749,7 +818,7 @@ impl Store for SqliteStore {
     async fn insert_event(&self, e: &EventRecord) -> Result<(), StoreError> {
         let e = e.clone();
         self.run(move |c| {
-            c.execute(
+            c.exec_cached(
                 "INSERT INTO auth_events (at_ms, user_id, kind, address, ip, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![e.at_ms, e.user_id.map(|u| u.to_string()), e.kind, e.address, e.ip, e.detail],
             )
@@ -788,7 +857,7 @@ impl Store for SqliteStore {
 
     async fn prune_events(&self, before_ms: i64) -> Result<u64, StoreError> {
         self.run(move |c| {
-            Ok(c.execute("DELETE FROM auth_events WHERE at_ms < ?1", [before_ms]).map_err(map_err)? as u64)
+            Ok(c.exec_cached("DELETE FROM auth_events WHERE at_ms < ?1", [before_ms]).map_err(map_err)? as u64)
         })
         .await
     }

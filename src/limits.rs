@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -129,12 +130,24 @@ impl Entry {
 
 struct Table<K> {
     map: HashMap<K, Entry>,
+    /// New entries let in without another scan: set when a scan couldn't
+    /// bring the table below `max` (the entries it may forget ran out,
+    /// because refused ones are kept), so a flood of new visitors costs one
+    /// scan per tenth of the table, not one each. Meanwhile the table can
+    /// pass `max` by that tenth plus the refused entries, never past twice
+    /// `max`; `tidy` starts the count afresh.
+    skip: usize,
 }
 
 impl<K: Eq + Hash + Copy> Table<K> {
     fn entry(&mut self, k: K, burst: u32, refill_ms: i64, window_ms: i64, max: usize, now: i64) -> &mut Entry {
         if !self.map.contains_key(&k) && self.map.len() >= max {
-            self.make_room(burst, refill_ms, window_ms, max, now);
+            if self.skip > 0 && self.map.len() < max.saturating_mul(2) {
+                self.skip -= 1;
+            } else {
+                self.make_room(burst, refill_ms, window_ms, max, now);
+                self.skip = if self.map.len() >= max { (max / 10).max(1) } else { 0 };
+            }
         }
         let e = self.map.entry(k).or_insert_with(|| Entry::new(burst, now));
         e.seen_ms = now;
@@ -189,8 +202,8 @@ impl Limiter {
     pub(crate) fn new(limits: Limits) -> Limiter {
         Limiter {
             limits,
-            visitors: Mutex::new(Table { map: HashMap::new() }),
-            remembered: Mutex::new(Table { map: HashMap::new() }),
+            visitors: Mutex::new(Table { map: HashMap::new(), skip: 0 }),
+            remembered: Mutex::new(Table { map: HashMap::new(), skip: 0 }),
         }
     }
 
@@ -261,9 +274,15 @@ impl Limiter {
         let l = &self.limits;
         let window = ms(l.window);
         let (vb, vr) = (l.visitor_burst, ms(l.visitor_refill).max(1));
-        lock(&self.visitors).map.retain(|_, e| !e.clean(vb, vr, window, now));
+        {
+            let mut t = lock(&self.visitors);
+            t.map.retain(|_, e| !e.clean(vb, vr, window, now));
+            t.skip = 0;
+        }
         let (rb, rr) = (l.remembered_burst, ms(l.remembered_refill).max(1));
-        lock(&self.remembered).map.retain(|_, e| !e.clean(rb, rr, window, now));
+        let mut t = lock(&self.remembered);
+        t.map.retain(|_, e| !e.clean(rb, rr, window, now));
+        t.skip = 0;
     }
 
     #[cfg(test)]
@@ -297,6 +316,198 @@ fn fail(e: &mut Entry, window_ms: i64, now: i64) -> u32 {
     e.failures = e.failures.saturating_add(1);
     e.last_failure_ms = now;
     e.failures
+}
+
+// ----- how many failures reach the store -----------------------------------------
+
+/// Failure events kept in the store with no account: this many at once…
+const ANONYMOUS_BURST: f64 = 100.0;
+/// …then one every this many milliseconds.
+const ANONYMOUS_EVERY_MS: f64 = 30_000.0;
+/// Failure events kept per account: this many at once…
+const ACCOUNT_BURST: f64 = 50.0;
+/// …then one every this many milliseconds.
+const ACCOUNT_EVERY_MS: f64 = 300_000.0;
+/// Accounts tracked at once, normally (each entry is a few dozen bytes).
+/// Accounts with failures still to report are kept beyond this, up to
+/// twice as many.
+const ACCOUNTS_TRACKED: usize = 100_000;
+/// Distinct addresses kept in each report of failures not stored.
+const REPORT_IPS: usize = 8;
+
+/// Failures that weren't stored, for the report at the next upkeep: how
+/// many, when the first and last were, and from which addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Dropped {
+    pub(crate) count: u64,
+    pub(crate) first_ms: i64,
+    pub(crate) last_ms: i64,
+    /// The first few distinct addresses.
+    pub(crate) ips: Vec<IpAddr>,
+    /// There were more addresses than listed.
+    pub(crate) more_ips: bool,
+}
+
+impl Dropped {
+    fn add(this: &mut Option<Dropped>, ip: Option<IpAddr>, now: i64) {
+        let d = this.get_or_insert_with(|| Dropped {
+            count: 0,
+            first_ms: now,
+            last_ms: now,
+            ips: Vec::new(),
+            more_ips: false,
+        });
+        d.count = d.count.saturating_add(1);
+        d.last_ms = now;
+        if let Some(ip) = ip
+            && !d.ips.contains(&ip)
+        {
+            if d.ips.len() < REPORT_IPS {
+                d.ips.push(ip);
+            } else {
+                d.more_ips = true;
+            }
+        }
+    }
+
+    /// The report as the detail of a `failures_not_stored` row.
+    pub(crate) fn to_json(&self, user: Option<Uuid>) -> String {
+        let mut v = serde_json::json!({
+            "count": self.count,
+            "first_ms": self.first_ms,
+            "last_ms": self.last_ms,
+            "ips": self.ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+            "more_ips": self.more_ips,
+        });
+        if let Some(u) = user {
+            v["user"] = serde_json::Value::String(u.to_string());
+        }
+        v.to_string()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Bucket {
+    tokens: f64,
+    at_ms: i64,
+    /// Failures not stored since the last report.
+    dropped: Option<Dropped>,
+}
+
+impl Bucket {
+    fn full(burst: f64, now: i64) -> Bucket {
+        Bucket { tokens: burst, at_ms: now, dropped: None }
+    }
+
+    fn refill(&mut self, burst: f64, every_ms: f64, now: i64) {
+        self.tokens = (self.tokens + (now - self.at_ms).max(0) as f64 / every_ms).min(burst);
+        self.at_ms = now;
+    }
+
+    fn take(&mut self, burst: f64, every_ms: f64, ip: Option<IpAddr>, now: i64) -> bool {
+        self.refill(burst, every_ms, now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            Dropped::add(&mut self.dropped, ip, now);
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct LogState {
+    anonymous: Option<Bucket>,
+    accounts: HashMap<Uuid, Bucket>,
+    /// New accounts to let in without another scan (as in the limiter).
+    skip: usize,
+}
+
+impl LogState {
+    /// Make room for one more account: forget accounts whose ration is whole
+    /// and that have nothing to report, then a tenth of the rest that have
+    /// nothing to report, the least drained first. Accounts with failures
+    /// to report are never forgotten. `false` when the table has reached
+    /// twice its size even so.
+    fn make_room(&mut self, now: i64) -> bool {
+        let max = ACCOUNTS_TRACKED;
+        if self.skip > 0 && self.accounts.len() < 2 * max {
+            self.skip -= 1;
+            return true;
+        }
+        self.accounts.retain(|_, b| {
+            b.refill(ACCOUNT_BURST, ACCOUNT_EVERY_MS, now);
+            b.dropped.is_some() || b.tokens < ACCOUNT_BURST
+        });
+        if self.accounts.len() >= max {
+            let mut quiet: Vec<(f64, Uuid)> =
+                self.accounts.iter().filter(|(_, b)| b.dropped.is_none()).map(|(u, b)| (b.tokens, *u)).collect();
+            quiet.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, u) in quiet.into_iter().take(max / 10) {
+                self.accounts.remove(&u);
+            }
+        }
+        if self.accounts.len() >= max {
+            self.skip = max / 10;
+        }
+        self.accounts.len() < 2 * max
+    }
+}
+
+/// Rations the failure events written to the store. Every event still goes
+/// to the `doorward::security` log target; only the rows are rationed, so a
+/// flood of cheap failures (a wrong passkey answer costs no hashing) can't
+/// fill the database or crowd out its writes. Per account: 50 at once, then
+/// one every five minutes; for failures with no account: 100 at once, then
+/// one every 30 seconds. What wasn't stored is reported at the next upkeep,
+/// as one row per account (and one without) with the count, the first and
+/// last time and the first few addresses.
+pub(crate) struct LogBudget {
+    state: Mutex<LogState>,
+}
+
+impl LogBudget {
+    pub(crate) fn new() -> LogBudget {
+        LogBudget { state: Mutex::new(LogState::default()) }
+    }
+
+    /// May this failure event, from `ip`, be stored?
+    pub(crate) fn allow(&self, user: Option<Uuid>, ip: Option<IpAddr>, now: i64) -> bool {
+        let mut st = lock(&self.state);
+        let st = &mut *st;
+        if let Some(u) = user
+            && (st.accounts.contains_key(&u) || st.accounts.len() < ACCOUNTS_TRACKED || st.make_room(now))
+        {
+            let b = st.accounts.entry(u).or_insert_with(|| Bucket::full(ACCOUNT_BURST, now));
+            return b.take(ACCOUNT_BURST, ACCOUNT_EVERY_MS, ip, now);
+        }
+        // No account, or (only past twice the table's size) no room to
+        // track one: the shared ration.
+        let b = st.anonymous.get_or_insert_with(|| Bucket::full(ANONYMOUS_BURST, now));
+        b.take(ANONYMOUS_BURST, ANONYMOUS_EVERY_MS, ip, now)
+    }
+
+    /// The failures not stored since the last call, by account, and forget
+    /// accounts that have nothing left to ration.
+    pub(crate) fn take_dropped(&self, now: i64) -> Vec<(Option<Uuid>, Dropped)> {
+        let mut st = lock(&self.state);
+        let mut out = Vec::new();
+        if let Some(d) = st.anonymous.as_mut().and_then(|b| b.dropped.take()) {
+            out.push((None, d));
+        }
+        for (u, b) in st.accounts.iter_mut() {
+            if let Some(d) = b.dropped.take() {
+                out.push((Some(*u), d));
+            }
+        }
+        st.accounts.retain(|_, b| {
+            b.refill(ACCOUNT_BURST, ACCOUNT_EVERY_MS, now);
+            b.tokens < ACCOUNT_BURST
+        });
+        st.skip = 0;
+        out
+    }
 }
 
 #[cfg(test)]
@@ -429,10 +640,100 @@ mod tests {
     }
 
     #[test]
+    fn a_table_full_of_refusals_is_scanned_once_per_tenth() {
+        let mut t: Table<u32> = Table { map: HashMap::new(), skip: 0 };
+        let refused = |now: i64| Entry { refused_until_ms: now + 1_000_000, failures: 0, ..Entry::new(20, now) };
+        for k in 0..100u32 {
+            t.map.insert(k, refused(0));
+        }
+        // The first newcomer scans and finds nothing to forget…
+        t.entry(1_000, 20, 3_000, 900_000, 100, 1);
+        assert_eq!((t.map.len(), t.skip), (101, 10));
+        // …so the next ten come in without a scan…
+        for k in 1_001..1_011u32 {
+            t.entry(k, 20, 3_000, 900_000, 100, 2);
+        }
+        assert_eq!((t.map.len(), t.skip), (111, 0));
+        // …and the one after scans again.
+        t.entry(2_000, 20, 3_000, 900_000, 100, 3);
+        assert_eq!(t.skip, 10);
+        // Newcomers that were let in aren't refused, so the next scan can
+        // forget them; refused entries are never forgotten below 2 × max.
+        for k in 0..100u32 {
+            assert!(t.map.contains_key(&k), "refused {k} kept");
+        }
+    }
+
+    #[test]
     fn settings_are_checked() {
         assert!(Limits::default().check().is_ok());
         assert!(Limits { visitor_burst: 0, ..Limits::default() }.check().is_err());
         assert!(Limits { visitor_refill: Duration::ZERO, ..Limits::default() }.check().is_err());
         assert!(Limits { tracked_max: 5, ..Limits::default() }.check().is_err());
+    }
+
+    #[test]
+    fn stored_failures_are_rationed_per_account_and_without_one() {
+        let b = LogBudget::new();
+        let alice = Some(Uuid::from_u128(1));
+        let bob = Some(Uuid::from_u128(2));
+        let ip = |n: u8| Some(IpAddr::from([198, 51, 100, n]));
+        let stored = |user, n: usize, now| (0..n).filter(|i| b.allow(user, ip((i % 12) as u8), now)).count();
+        assert_eq!(stored(alice, 80, 0), 50, "50 at once for an account");
+        assert_eq!(stored(bob, 10, 0), 10, "another account has its own");
+        assert_eq!(stored(None, 150, 0), 100, "100 at once without an account");
+        // Five minutes later, one more for alice; 30 seconds, one more without.
+        assert_eq!(stored(alice, 5, 300_000), 1);
+        assert_eq!(stored(None, 30, 300_000), 10);
+        // What wasn't stored is reported once, with when and from where.
+        let mut dropped = b.take_dropped(300_000);
+        dropped.sort_by_key(|(u, _)| *u);
+        assert_eq!(dropped.len(), 2);
+        let (none, a) = (&dropped[0], &dropped[1]);
+        assert_eq!((none.0, none.1.count, none.1.first_ms, none.1.last_ms), (None, 70, 0, 300_000));
+        assert_eq!((a.0, a.1.count), (alice, 34));
+        assert_eq!(a.1.ips.len(), REPORT_IPS);
+        assert!(a.1.more_ips);
+        assert!(a.1.to_json(alice).contains(r#""count":34"#));
+        assert!(b.take_dropped(300_000).is_empty());
+        // Accounts with a whole ration are forgotten.
+        assert!(b.take_dropped(100_000_000).is_empty());
+        assert!(lock(&b.state).accounts.is_empty());
+    }
+
+    #[test]
+    fn a_full_account_table_never_loses_an_accounts_report() {
+        let b = LogBudget::new();
+        // Every tracked account has drained its ration and has failures to
+        // report, as an attacker could arrange.
+        {
+            let mut st = lock(&b.state);
+            for i in 0..ACCOUNTS_TRACKED as u128 {
+                let mut bucket = Bucket::full(ACCOUNT_BURST, 0);
+                bucket.tokens = 0.0;
+                Dropped::add(&mut bucket.dropped, None, 0);
+                st.accounts.insert(Uuid::from_u128(i + 1_000_000), bucket);
+            }
+        }
+        // A victim's failures are still rationed and reported as theirs.
+        let victim = Some(Uuid::from_u128(7));
+        let kept = (0..60).filter(|_| b.allow(victim, None, 1)).count();
+        assert_eq!(kept, 50);
+        let report = b.take_dropped(1).into_iter().find(|(u, _)| *u == victim).expect("the victim's report");
+        assert_eq!(report.1.count, 10);
+        // Accounts with nothing to report make way first, the least drained first.
+        let quiet = LogBudget::new();
+        {
+            let mut st = lock(&quiet.state);
+            for i in 0..ACCOUNTS_TRACKED as u128 {
+                let mut bucket = Bucket::full(ACCOUNT_BURST, 0);
+                bucket.tokens = if i == 0 { 1.0 } else { 49.0 };
+                st.accounts.insert(Uuid::from_u128(i + 1_000_000), bucket);
+            }
+        }
+        assert!(quiet.allow(victim, None, 1));
+        let st = lock(&quiet.state);
+        assert!(st.accounts.len() <= ACCOUNTS_TRACKED);
+        assert!(st.accounts.contains_key(&Uuid::from_u128(1_000_000)), "the most drained stays");
     }
 }

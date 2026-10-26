@@ -36,7 +36,10 @@ impl Username {
         if input.len() > MAX_INPUT_BYTES {
             return Err(Error::UsernameInvalid);
         }
-        let display: String = input.trim().nfkc().collect();
+        // Normalising can multiply the input (one character can become 18),
+        // so stop one character past the limit: a longer name is refused
+        // either way.
+        let display: String = input.trim().nfkc().take(MAX_USERNAME_CHARS + 1).collect();
         let chars = display.chars().count();
         if chars == 0 || chars > MAX_USERNAME_CHARS {
             return Err(Error::UsernameInvalid);
@@ -84,7 +87,7 @@ pub(crate) fn lookup_key(input: &str) -> Option<String> {
     if input.len() > MAX_INPUT_BYTES {
         return None;
     }
-    let display: String = input.trim().nfkc().collect();
+    let display: String = input.trim().nfkc().take(MAX_USERNAME_CHARS + 1).collect();
     if display.is_empty()
         || display.chars().count() > MAX_USERNAME_CHARS
         || !display.chars().all(|c| c.is_alphanumeric() || PUNCTUATION.contains(&c))
@@ -210,6 +213,13 @@ mod tests {
         assert!(Username::parse(&"a".repeat(64)).is_ok());
         assert_eq!(lookup_key(&"x".repeat(5000)), None);
         assert_eq!(lookup_key(""), None);
+        // A character that normalises to 18 stops being normalised past the
+        // limit, and is refused all the same.
+        let swollen = "\u{fdfa}".repeat(300);
+        assert_eq!(lookup_key(&swollen), None);
+        assert!(Username::parse(&swollen).is_err());
+        assert!(Username::parse(&format!("{}x", "a".repeat(64))).is_err());
+        assert_eq!(lookup_key(&"a".repeat(64)).as_deref(), Some("a".repeat(64).as_str()));
         // Characters no username has are never looked up (a NUL would make
         // Postgres fail the query).
         for n in ["tech1\u{0}", "a b", "a\tb", "x;y", "a\u{202e}b", "a\u{7f}"] {

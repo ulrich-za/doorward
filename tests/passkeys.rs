@@ -461,3 +461,35 @@ async fn account_holders_cant_block_the_owners_passkey_sign_in() {
     assert_eq!(n, 8 + 15 * 8);
     assert!(e.dw.passkey_sign_in_start(&owner.post(&e.dw)).await.is_ok(), "the owner still starts one");
 }
+
+#[tokio::test]
+async fn failures_with_no_account_are_rationed_in_the_store() {
+    // A wrong passkey answer costs an attacker almost nothing, so the rows it
+    // leaves in the store are rationed: 100 at once without an account.
+    let limits = doorward::Limits {
+        visitor_burst: 10_000,
+        refuse_after: 10_000,
+        slow_step: Duration::ZERO,
+        ..Default::default()
+    };
+    let e = env_with(|b| b.limits(limits)).await;
+    let mut stranger = TestAuthenticator::new();
+    let fake = serde_json::json!({"publicKey": {"rp": {"id": "pc.lan"}, "user": {"id": base64url(&[7; 16])}, "challenge": "AAAA"}});
+    stranger.register(LAN, &fake).unwrap();
+    let b = Browser::lan();
+    for _ in 0..150 {
+        let start = e.dw.passkey_sign_in_start(&b.post(&e.dw)).await.unwrap();
+        let answer = cred(stranger.sign_in(LAN, &serde_json::to_value(&start.options).unwrap()).unwrap());
+        let err = e.dw.passkey_sign_in_finish(&b.post(&e.dw), &start.ceremony, &answer, false).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::PasskeyNotRecognised);
+    }
+    let anonymous = |kind: &str| {
+        e.store.all_events().into_iter().filter(|x| x.user_id.is_none() && x.kind == kind).collect::<Vec<_>>()
+    };
+    assert_eq!(anonymous("sign_in_failed").len(), 100);
+    e.dw.upkeep().await.unwrap();
+    let summary = anonymous("failures_not_stored");
+    assert_eq!(summary.len(), 1);
+    let detail: serde_json::Value = serde_json::from_str(summary[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["count"], 50);
+}

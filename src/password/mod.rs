@@ -86,8 +86,38 @@ struct Active {
     /// A stand-in hash that unknown usernames are checked against, so they
     /// take as long as real ones.
     dummy: String,
-    /// How long making the stand-in took, in milliseconds.
-    dummy_ms: u64,
+    /// The least time every answer is held to: a quarter more than the
+    /// slowest of the calibrated time and two timed checks.
+    start_floor_ms: u64,
+}
+
+/// Margin over the slowest check measured when the settings are set.
+const START_MARGIN: f64 = 1.25;
+/// Margin over the slowest of the recent checks with the current settings.
+const RECENT_MARGIN: f64 = 1.1;
+/// How many recent checks with the current settings are remembered.
+const RECENT_CHECKS: usize = 16;
+/// The recent checks can raise the floor to at most this many times the
+/// start floor, so a load spike can't hold answers back without bound.
+const RECENT_CAP: u64 = 4;
+
+/// The durations of the last few checks that ran with the current settings
+/// (stand-in checks, and saved hashes that use the current settings).
+#[derive(Default)]
+struct Recent {
+    ms: [u64; RECENT_CHECKS],
+    next: usize,
+}
+
+impl Recent {
+    fn record(&mut self, ms: u64) {
+        self.ms[self.next] = ms;
+        self.next = (self.next + 1) % RECENT_CHECKS;
+    }
+
+    fn slowest(&self) -> u64 {
+        self.ms.iter().copied().max().unwrap_or(0)
+    }
 }
 
 /// Hashes and checks passwords with the policy in force.
@@ -101,6 +131,7 @@ struct Active {
 /// while their check still runs).
 pub struct Hasher {
     active: RwLock<Active>,
+    recent: std::sync::Mutex<Recent>,
     gate: Arc<tokio::sync::Semaphore>,
 }
 
@@ -114,9 +145,10 @@ impl Hasher {
     /// A hasher for `policy`. Hashes one random stand-in password, so this
     /// blocks for one check.
     pub fn new(policy: HashPolicy) -> Result<Hasher, Error> {
-        let (dummy, dummy_ms) = make_dummy(&policy)?;
+        let (dummy, start_floor_ms) = make_dummy(&policy)?;
         Ok(Hasher {
-            active: RwLock::new(Active { policy, dummy, dummy_ms }),
+            active: RwLock::new(Active { policy, dummy, start_floor_ms }),
+            recent: std::sync::Mutex::new(Recent::default()),
             gate: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
@@ -129,19 +161,24 @@ impl Hasher {
     /// Switch to a newly tuned policy. Saved hashes keep working; each one is
     /// reported as needing a rehash at its next successful check.
     pub fn replace(&self, policy: HashPolicy) -> Result<(), Error> {
-        let (dummy, dummy_ms) = make_dummy(&policy)?;
+        let (dummy, start_floor_ms) = make_dummy(&policy)?;
         let mut w = self.active.write().unwrap_or_else(|e| e.into_inner());
-        *w = Active { policy, dummy, dummy_ms };
+        *w = Active { policy, dummy, start_floor_ms };
+        *self.recent.lock().unwrap_or_else(|e| e.into_inner()) = Recent::default();
         Ok(())
     }
 
-    /// How long every check is made to take at least: the policy's measured
-    /// time, or the stand-in's, whichever is longer. A saved hash made with
-    /// cheaper, older settings then can't reveal (by answering sooner) that
-    /// its user exists.
+    /// How long every answer is held to at least, so a saved hash with
+    /// cheaper, older settings (or one that is refused unhashed) can't reveal
+    /// by answering sooner that its user exists: the larger of the start
+    /// floor and a tenth more than the slowest of the last 16 checks with the
+    /// current settings (which follows the machine's load), the latter
+    /// capped at four times the start floor.
     fn floor_ms(&self) -> u64 {
-        let a = self.read();
-        (a.policy.check_ms as u64).max(a.dummy_ms)
+        let start = self.read().start_floor_ms;
+        let slowest = self.recent.lock().unwrap_or_else(|e| e.into_inner()).slowest();
+        let recent = ((slowest as f64) * RECENT_MARGIN).ceil() as u64;
+        start.max(recent.min(start.saturating_mul(RECENT_CAP)))
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Active> {
@@ -165,18 +202,24 @@ impl Hasher {
     /// instead, so the answer takes as long, and is always [`Verdict::Wrong`].
     /// Blocks for one check.
     pub fn verify(&self, password: &str, phc: Option<&str>) -> Verdict {
+        self.check(password, phc).0
+    }
+
+    /// [`Hasher::verify`], also saying whether the check ran Argon2 with the
+    /// current settings.
+    fn check(&self, password: &str, phc: Option<&str>) -> (Verdict, bool) {
         let (policy, dummy) = {
             let a = self.read();
             (a.policy, a.dummy.clone())
         };
         if password.len() > MAX_PASSWORD_BYTES {
-            return Verdict::Wrong;
+            return (Verdict::Wrong, false);
         }
         match phc {
             Some(phc) => check_with(password.as_bytes(), phc, &policy),
             None => match check_with(password.as_bytes(), &dummy, &policy) {
-                Verdict::Busy => Verdict::Busy,
-                _ => Verdict::Wrong,
+                (Verdict::Busy, current) => (Verdict::Busy, current),
+                (_, current) => (Verdict::Wrong, current),
             },
         }
     }
@@ -243,7 +286,13 @@ impl Hasher {
         let me = self.clone();
         let verdict = tokio::task::spawn_blocking(move || {
             let _held = (turn, extra);
-            me.verify(&password, phc.as_deref())
+            let t = Instant::now();
+            let (verdict, current) = me.check(&password, phc.as_deref());
+            if current {
+                let ms = t.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                me.recent.lock().unwrap_or_else(|e| e.into_inner()).record(ms);
+            }
+            verdict
         })
         .await
         .unwrap_or(Verdict::Wrong);
@@ -254,12 +303,27 @@ impl Hasher {
     }
 }
 
+/// The stand-in hash, and the start floor: a quarter more than the slowest
+/// of the calibrated check time, making the stand-in, and checking a wrong
+/// password against it. Taking the slowest (not the quickest) keeps the
+/// floor above a normal check, so answers held to it look like real checks.
 fn make_dummy(policy: &HashPolicy) -> Result<(String, u64), Error> {
     let mut random = Zeroizing::new([0u8; 24]);
     getrandom::fill(random.as_mut()).map_err(|_| Error::Random)?;
     let started = Instant::now();
     let dummy = hash_with(random.as_ref(), policy)?;
-    Ok((dummy, started.elapsed().as_millis().min(u64::MAX as u128) as u64))
+    let made = started.elapsed();
+    getrandom::fill(random.as_mut()).map_err(|_| Error::Random)?;
+    let started = Instant::now();
+    let (_, hashed) = check_with(random.as_ref(), &dummy, policy);
+    let checked = started.elapsed();
+    if !hashed {
+        // The check didn't run (no memory just now): don't let its time count.
+        return Err(Error::Busy);
+    }
+    let slowest = made.max(checked).as_secs_f64() * 1000.0;
+    let floor = slowest.max(f64::from(policy.check_ms)) * START_MARGIN;
+    Ok((dummy, floor.ceil().min(u64::MAX as f64) as u64))
 }
 
 fn hash_with(password: &[u8], policy: &HashPolicy) -> Result<String, Error> {
@@ -271,21 +335,24 @@ fn hash_with(password: &[u8], policy: &HashPolicy) -> Result<String, Error> {
     }
 }
 
-fn check_with(password: &[u8], phc: &str, policy: &HashPolicy) -> Verdict {
+/// Check `password` against a saved hash. The flag says whether Argon2 ran
+/// with exactly the current settings (so the check's time is what a
+/// stand-in check takes).
+fn check_with(password: &[u8], phc: &str, policy: &HashPolicy) -> (Verdict, bool) {
     if phc.len() > 512 {
         tracing::warn!(target: "doorward::security", "a saved password hash is implausibly long; refusing it");
-        return Verdict::Wrong;
+        return (Verdict::Wrong, false);
     }
     let Ok(hash) = PasswordHash::new(phc) else {
         tracing::warn!(target: "doorward::security", "a saved password hash is unreadable");
-        return Verdict::Wrong;
+        return (Verdict::Wrong, false);
     };
     if !hash.algorithm.as_str().starts_with("argon2") {
         tracing::warn!(target: "doorward::security", "a saved password hash isn't Argon2; refusing it");
-        return Verdict::Wrong;
+        return (Verdict::Wrong, false);
     }
     let Ok(saved) = Params::try_from(&hash) else {
-        return Verdict::Wrong;
+        return (Verdict::Wrong, false);
     };
     if !sane(&saved) {
         tracing::warn!(
@@ -295,22 +362,26 @@ fn check_with(password: &[u8], phc: &str, policy: &HashPolicy) -> Verdict {
             p = saved.p_cost(),
             "a saved password hash asks for too much work; refusing it"
         );
-        return Verdict::Wrong;
+        return (Verdict::Wrong, false);
     }
+    let current = hash.algorithm.as_str() == "argon2id"
+        && hash.version == Some(Version::V0x13.into())
+        && saved.m_cost() == policy.m_kib
+        && saved.t_cost() == policy.t
+        && saved.p_cost() == policy.p;
     // The hash's own algorithm, version and settings are used, so hashes made
     // with older settings keep verifying.
     match Argon2::default().verify_password(password, &hash) {
-        Ok(()) => Verdict::Good {
-            rehash: hash.algorithm.as_str() != "argon2id"
-                || hash.version != Some(Version::V0x13.into())
-                || saved.m_cost() != policy.m_kib
-                || saved.t_cost() != policy.t
-                || saved.p_cost() != policy.p
-                || saved.output_len().is_some_and(|l| l != Params::DEFAULT_OUTPUT_LEN)
-                || hash.salt.as_ref().is_none_or(|s| s.len() < 16),
-        },
-        Err(argon2::password_hash::Error::OutOfMemory) => Verdict::Busy,
-        Err(_) => Verdict::Wrong,
+        Ok(()) => (
+            Verdict::Good {
+                rehash: !current
+                    || saved.output_len().is_some_and(|l| l != Params::DEFAULT_OUTPUT_LEN)
+                    || hash.salt.as_ref().is_none_or(|s| s.len() < 16),
+            },
+            current,
+        ),
+        Err(argon2::password_hash::Error::OutOfMemory) => (Verdict::Busy, false),
+        Err(_) => (Verdict::Wrong, current),
     }
 }
 
@@ -462,6 +533,61 @@ mod tests {
             h.verify_async(Zeroizing::new("pw".into()), Some(cheap), std::time::Duration::from_secs(5)).await.is_good()
         );
         assert!(t.elapsed() >= std::time::Duration::from_millis(300), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn the_floor_follows_slow_checks_up_to_a_cap() {
+        let h = Hasher::new(HashPolicy { check_ms: 100, concurrency: 2, ..HashPolicy::floor() }).unwrap();
+        let start = h.floor_ms();
+        assert!(start >= 125, "a quarter over the calibrated time: {start}");
+        // Checks slowed by load raise the floor to a tenth over the slowest…
+        h.recent.lock().unwrap().record(start * 2);
+        assert_eq!(h.floor_ms(), ((start * 2) as f64 * 1.1).ceil() as u64);
+        // …but no further than four times the start floor.
+        h.recent.lock().unwrap().record(start * 100);
+        assert_eq!(h.floor_ms(), start * 4);
+        // Once 16 quicker checks have passed, it comes back down.
+        for _ in 0..RECENT_CHECKS {
+            h.recent.lock().unwrap().record(1);
+        }
+        assert_eq!(h.floor_ms(), start);
+        // A retune starts afresh.
+        h.recent.lock().unwrap().record(start * 2);
+        h.replace(HashPolicy { check_ms: 100, concurrency: 2, ..HashPolicy::floor() }).unwrap();
+        assert!(h.floor_ms() < start * 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn older_hashes_answer_no_sooner_than_unknown_names() {
+        use std::time::Duration;
+        // The current settings cost more than an older saved hash, as after
+        // a retune: the older hash is checked quicker, but its answer must
+        // not come sooner than one for an unknown name.
+        let h = Arc::new(
+            Hasher::new(HashPolicy { m_kib: 32 * 1024, t: 4, concurrency: 2, ..HashPolicy::floor() }).unwrap(),
+        );
+        let older =
+            Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, Params::new(19 * 1024, 2, 1, None).unwrap())
+                .hash_password(b"pw")
+                .unwrap()
+                .to_string();
+        let time = |phc: Option<String>| {
+            let h = h.clone();
+            async move {
+                let t = std::time::Instant::now();
+                let _ = h.verify_async(Zeroizing::new("wrong".into()), phc, Duration::from_secs(10)).await;
+                t.elapsed()
+            }
+        };
+        let (mut unknown, mut old) = (Vec::new(), Vec::new());
+        for _ in 0..15 {
+            unknown.push(time(None).await);
+            old.push(time(Some(older.clone())).await);
+        }
+        unknown.sort();
+        old.sort();
+        let (u, o) = (unknown[7].as_secs_f64(), old[7].as_secs_f64());
+        assert!((u - o).abs() <= 0.03 * u, "median unknown {u:.4}s, older hash {o:.4}s");
     }
 
     #[test]

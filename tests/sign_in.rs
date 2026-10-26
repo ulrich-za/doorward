@@ -791,3 +791,60 @@ async fn disabling_an_account_forgets_its_remembered_browsers() {
     e.dw.remove_password(u.id).await.unwrap();
     assert!(e.remembered(&b).await.is_none(), "and so does removing the password");
 }
+
+#[tokio::test]
+async fn failures_kept_in_the_store_are_rationed() {
+    // Every failure goes to the log target; the store keeps 50 per account
+    // at once and reports the rest at the next upkeep.
+    let limits = Limits { visitor_burst: 1000, slow_step: Duration::ZERO, refuse_after: 1000, ..Limits::default() };
+    let e = env_with(|b| b.limits(limits)).await;
+    let u = e.user("admin", Some("correct horse battery")).await;
+    let b = Browser::lan();
+    for _ in 0..60 {
+        let r = e.dw.sign_in_password(&b.post(&e.dw), "admin", "wrong", false).await;
+        assert_eq!(r.unwrap_err().code(), ErrorCode::InvalidCredentials);
+    }
+    let kinds = |list: Vec<doorward::store::EventRecord>| list.into_iter().map(|x| x.kind).collect::<Vec<_>>();
+    let stored = kinds(e.store.events_for_user(u.id, 100).await.unwrap());
+    assert_eq!(stored.iter().filter(|k| *k == "sign_in_failed").count(), 50);
+    e.dw.upkeep().await.unwrap();
+    let rows = e.store.events_for_user(u.id, 1).await.unwrap();
+    assert_eq!(rows[0].kind, "failures_not_stored");
+    let detail: serde_json::Value = serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["count"], 10);
+    assert_eq!(detail["ips"], serde_json::json!(["192.168.1.20"]), "where they came from");
+    assert!(detail["first_ms"].as_i64().unwrap() <= detail["last_ms"].as_i64().unwrap());
+    // Successes are never rationed.
+    let _signed_in = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+    assert_eq!(e.store.events_for_user(u.id, 1).await.unwrap()[0].kind, "sign_in");
+}
+
+#[tokio::test]
+async fn sign_ins_beyond_the_session_limit_end_the_oldest() {
+    let e = env_with(|b| b.max_sessions_per_user(3)).await;
+    let u = e.user("admin", Some("correct horse battery")).await;
+    let mut browsers = Vec::new();
+    for _ in 0..5 {
+        let mut b = Browser::lan();
+        let s = e.dw.sign_in_password(&b.post(&e.dw), "admin", "correct horse battery", false).await.unwrap();
+        b.take(&s.cookies);
+        browsers.push(b);
+        e.clock.advance(Duration::from_secs(1));
+    }
+    for (i, b) in browsers.iter().enumerate() {
+        assert_eq!(e.dw.authenticate(&b.get(&e.dw)).await.unwrap().is_some(), i >= 2, "browser {i}");
+    }
+    assert_eq!(e.store.sessions_for_user(u.id).await.unwrap().len(), 3);
+    let ended: Vec<_> =
+        e.store.events_for_user(u.id, 50).await.unwrap().into_iter().filter(|x| x.kind == "sessions_ended").collect();
+    assert_eq!(ended.len(), 2, "each sign-in over the limit is logged");
+    for bad in [0, 1001] {
+        let r = doorward::Doorward::builder(doorward::store::MemoryStore::new())
+            .address(doorward::Address::new(LAN).unwrap())
+            .hash_policy(HashPolicy::floor())
+            .max_sessions_per_user(bad)
+            .build()
+            .await;
+        assert!(matches!(r, Err(Error::Config(_))), "{bad}");
+    }
+}

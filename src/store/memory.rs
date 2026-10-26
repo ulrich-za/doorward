@@ -38,6 +38,12 @@ impl MemoryStore {
         MemoryStore::default()
     }
 
+    /// Every event in the security log, oldest first, with or without a
+    /// user (for tests).
+    pub fn all_events(&self) -> Vec<EventRecord> {
+        self.lock().events.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         // Every change below is a single step, so a poisoned lock never
         // guards a half-made change.
@@ -187,6 +193,15 @@ impl Store for MemoryStore {
 
     async fn session_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<SessionRecord>, StoreError> {
         Ok(self.lock().sessions.values().find(|x| &x.token_hash == token_hash).cloned())
+    }
+
+    async fn session_with_user(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<(SessionRecord, Option<UserRecord>)>, StoreError> {
+        let st = self.lock();
+        let Some(s) = st.sessions.values().find(|x| &x.token_hash == token_hash) else { return Ok(None) };
+        Ok(Some((s.clone(), st.users.get(&s.user_id).cloned())))
     }
 
     async fn touch_session(&self, id: Uuid, last_seen_ms: i64, ip: Option<&str>) -> Result<(), StoreError> {

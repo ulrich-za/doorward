@@ -5,6 +5,56 @@ All notable changes to doorward are listed here. The format follows
 by the last number (0.1.1, 0.1.2, …) unless stated otherwise. Below 1.0, a
 release may change the API: read the notes before upgrading.
 
+## [0.1.1] - 2026-10-26
+
+An independent performance analysis (Big O, CPU-cycle benchmarks,
+profiling) found the places below. Each is fixed and has a test, and a
+separate security review of the changes found one that weakened timing
+equality (the first padding change), which was fixed before release. See
+`docs/performance.md`.
+
+### Changed
+
+- The security log rations failed attempts in the store: per account 50 at
+  once, then one every five minutes; without an account 100 at once, then
+  one every 30 seconds. Every event still goes to the `doorward::security`
+  log target, `_refused` events (which need a valid credential) are always
+  stored, and what wasn't stored is reported in a `failures_not_stored` row
+  at the next upkeep, with the count, the first and last time and the
+  first few addresses. A flood of wrong passkey answers (which cost no
+  hashing) can no longer fill the database or crowd out its writes.
+- A password attempt from a visitor without a remembered-browser cookie
+  checks the rate limit before any store work, so a refused attempt costs
+  no lookup (one with such a cookie costs the cookie's lookup first, as
+  before).
+- Usernames are normalised only up to one character past the limit (NFKC
+  can make one character eighteen), so a long name costs microseconds.
+- The rate-limit table, once full of refused visitors, scans for room once
+  per tenth of its size instead of on every new visitor (same eviction
+  rules, same bound of twice `tracked_max`).
+- Argon2 calibration separates the fixed cost of a hash (getting the memory)
+  from the cost per pass, so it picks the passes that fit about 350 ms
+  rather than undershooting (more passes in the same time).
+- The time every password answer is held to is now a quarter more than the
+  slowest of the calibrated time and two checks timed at start, and rises
+  to a tenth more than the slowest of the last 16 checks with the current
+  settings when the machine is busy (at most four times the start value).
+  Saved hashes with older, cheaper settings (after a retune, or imported)
+  can't be told apart from unknown names by response time, even under load.
+- A sign-in that ends sessions over the per-user limit logs a
+  `sessions_ended` event.
+- doorward-sqlite caches every prepared statement instead of parsing its SQL
+  on each call.
+
+### Added
+
+- `Store::session_with_user`: the session and its user in one step, used by
+  every signed-in request. It has a default (two calls); doorward-sqlite
+  does it in one trip to its thread and doorward-postgres in one query.
+- `Builder::max_sessions_per_user` (default 50): a sign-in beyond it ends
+  the user's oldest sessions.
+- `MemoryStore::all_events`, for tests.
+
 ## [0.1.0] - 2026-10-25
 
 First release: headless sign-in for Rust web apps, starting with what
@@ -98,4 +148,5 @@ addresses and storage for SQLite and Postgres.
 - Changing the password needs the current one, and re-authenticating issues a
   new cookie.
 
+[0.1.1]: https://github.com/ulrich-za/doorward/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ulrich-za/doorward/releases/tag/v0.1.0
