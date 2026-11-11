@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --features axum,passkeys,test-util
 
@@ -101,7 +101,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit
-      - run: cargo audit --file doorward-postgres/Cargo.lock
+      # sqlx lists its SQLite driver in every lock file, though only the
+      # Postgres one is built here (`cargo tree -i libsqlite3-sys` is empty),
+      # so the SQLite advisory doesn't apply to this crate. Revisit when sqlx
+      # moves to libsqlite3-sys 0.39.
+      - run: cargo audit --file doorward-postgres/Cargo.lock --ignore RUSTSEC-2026-0459
 
   browser:
     runs-on: ubuntu-latest

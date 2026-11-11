@@ -2,7 +2,7 @@
 name = "doorward"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Headless sign-in for Rust web apps: machine-sized Argon2id, passkeys, address-bound sessions, lockout-proof rate limits"
 authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
 license = "Apache-2.0"

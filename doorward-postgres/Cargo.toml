@@ -2,7 +2,7 @@
 name = "doorward-postgres"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "PostgreSQL storage for doorward (sign-in for Rust web apps), through sqlx"
 authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
 license = "Apache-2.0"

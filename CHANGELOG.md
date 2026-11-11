@@ -5,6 +5,19 @@ All notable changes to doorward are listed here. The format follows
 by the last number (0.1.1, 0.1.2, …) unless stated otherwise. Below 1.0, a
 release may change the API: read the notes before upgrading.
 
+## [Unreleased]
+
+### Security
+
+- doorward-sqlite needs rusqlite 0.41, whose bundled SQLite fixes
+  CVE-2026-119375 (RUSTSEC-2026-0459). Earlier versions are no longer
+  accepted. doorward itself runs only its own fixed queries, so the flaw was
+  not reachable through it.
+
+### Changed
+
+- The minimum Rust version is 1.89 (rusqlite 0.41 needs it).
+
 ## [0.1.1] - 2026-10-26
 
 An independent performance analysis (Big O, CPU-cycle benchmarks,

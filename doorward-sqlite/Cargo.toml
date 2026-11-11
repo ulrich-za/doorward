@@ -2,7 +2,7 @@
 name = "doorward-sqlite"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "SQLite storage for doorward (sign-in for Rust web apps)"
 authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
 license = "Apache-2.0"
@@ -19,15 +19,16 @@ bundled = ["rusqlite/bundled"]
 [dependencies]
 doorward = { version = "0.1.1", path = "..", default-features = false }
 async-trait = "0.1.89"
-# A range, so an app on any of these rusqlite versions shares one SQLite.
-rusqlite = { version = ">=0.40.2, <0.42" }
+# From 0.41: earlier versions bundle an SQLite with a known flaw
+# (RUSTSEC-2026-0459).
+rusqlite = { version = "0.41" }
 tokio = { version = "1.48", default-features = false, features = ["rt"] }
 uuid = { version = "1.18", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 doorward = { version = "0.1.1", path = "..", features = ["test-util"] }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
-rusqlite = { version = ">=0.40.2, <0.42" }
+rusqlite = { version = "0.41" }
 http = "1.3"
 
 [lints.rust]
