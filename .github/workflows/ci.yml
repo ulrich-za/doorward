@@ -44,6 +44,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
+      # Building OpenSSL needs a full Perl. Under bash the runner finds Git's
+      # cut-down one first, which lacks modules OpenSSL's Configure uses.
+      - if: runner.os == 'Windows'
+        name: Use Strawberry Perl for the OpenSSL build
+        shell: pwsh
+        run: |
+          $perl = "C:\Strawberry\perl\bin\perl.exe"
+          if (-not (Test-Path $perl)) { choco install strawberryperl -y --no-progress }
+          if (-not (Test-Path $perl)) { throw "Strawberry Perl not found at $perl" }
+          "OPENSSL_SRC_PERL=$perl" >> $env:GITHUB_ENV
       - name: Tests
         shell: bash
         run: |

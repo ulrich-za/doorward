@@ -30,21 +30,29 @@ async fn older_hashes_answer_no_sooner_than_unknown_names() {
             t.elapsed().as_secs_f64()
         }
     };
-    let (mut unknown, mut old) = (Vec::new(), Vec::new());
+    // Timed in pairs, and judged by the typical gap within a pair. Every
+    // answer is held to a floor that steps up when the machine slows down;
+    // the pair timed across such a step differs by the step, and comparing
+    // the two medians instead would report that one pair as a leak whenever
+    // the step falls mid-run. A real leak shows in every pair.
+    let mut gaps = Vec::new();
+    let mut unknown = Vec::new();
     for _ in 0..21 {
-        unknown.push(time(None).await);
-        old.push(time(Some(older.clone())).await);
+        let u = time(None).await;
+        let o = time(Some(older.clone())).await;
+        unknown.push(u);
+        gaps.push(o - u);
     }
+    gaps.sort_by(f64::total_cmp);
     unknown.sort_by(f64::total_cmp);
-    old.sort_by(f64::total_cmp);
-    let (u, o) = (unknown[10], old[10]);
+    let (gap, u) = (gaps[10], unknown[10]);
     // Answers end with a sleep, so the OS timer's granularity (about 15 ms
     // on Windows, well under 1 ms elsewhere) blurs them; allow for it.
     let tick = timer_granularity().await;
     let allowed = 0.04 * u + 2.0 * tick;
     assert!(
-        (u - o).abs() <= allowed,
-        "median answer: unknown name {u:.4} s, older hash {o:.4} s (timer granularity {tick:.4} s)"
+        gap.abs() <= allowed,
+        "an older hash typically answers {gap:+.4} s from an unknown name ({u:.4} s); allowed {allowed:.4} s (timer granularity {tick:.4} s)"
     );
 }
 

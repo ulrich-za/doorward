@@ -318,10 +318,7 @@ mod tests {
 
     #[test]
     fn hosts() {
-        assert_eq!(
-            parse_host("Pc.Lan:8040"),
-            Some(HostPort { host: "pc.lan".into(), port: Some(8040) })
-        );
+        assert_eq!(parse_host("Pc.Lan:8040"), Some(HostPort { host: "pc.lan".into(), port: Some(8040) }));
         assert_eq!(parse_host("example.com."), Some(HostPort { host: "example.com".into(), port: None }));
         assert_eq!(parse_host("[::1]:8443"), Some(HostPort { host: "[::1]".into(), port: Some(8443) }));
         assert_eq!(parse_host("192.168.1.5"), Some(HostPort { host: "192.168.1.5".into(), port: None }));
